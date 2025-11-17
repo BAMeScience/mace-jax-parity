@@ -268,7 +268,7 @@ def main() -> None:
                         indices, diff, energy_torch, energy_jax
                     ):
                         if delta > args.energy_tol:
-                            print(
+                            tqdm.write(
                                 f"[WARN] {h5_path.name} graph #{idx} batch {batch_id}: "
                                 f"|ΔE|={delta:.3e} eV exceeds tol {args.energy_tol:.1e} "
                                 f"(torch={e_t:.6f}, jax={e_j:.6f})"
