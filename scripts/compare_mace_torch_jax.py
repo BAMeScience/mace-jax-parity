@@ -16,6 +16,7 @@ import numpy as np
 import torch
 from torch_geometric.data import Batch
 from torch_geometric.loader import DataLoader as PyGDataLoader
+from tqdm import tqdm
 
 try:  # pragma: no cover - torch<2.6 compatibility
     from torch.serialization import add_safe_globals
@@ -62,8 +63,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--split",
         choices=("train", "valid", "all"),
-        default="valid",
-        help='Which split to evaluate (default: valid). Use "all" to process every *.h5 file.',
+        default="train",
+        help='Which split to evaluate (default: train). Use "all" to process every *.h5 file.',
     )
     parser.add_argument(
         "--batch-size",
@@ -232,7 +233,9 @@ def main() -> None:
     with torch.no_grad():
         for h5_path in h5_files:
             loader = _build_loader(h5_path, z_table, r_max, args.batch_size)
-            for batch_id, batch in enumerate(loader):
+            for batch_id, batch in enumerate(
+                tqdm(loader, desc=f'compare {h5_path.name}', leave=False)
+            ):
                 batch = batch.to(device)
                 batch = _cast_batch(batch, torch_dtype)
 
