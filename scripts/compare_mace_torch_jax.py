@@ -62,7 +62,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--split",
         choices=("train", "valid", "all"),
-        default="train",
+        default="valid",
         help='Which split to evaluate (default: valid). Use "all" to process every *.h5 file.',
     )
     parser.add_argument(
@@ -78,16 +78,10 @@ def _parse_args() -> argparse.Namespace:
         help="Absolute tolerance (in eV) before reporting a discrepancy (default: 1e-5).",
     )
     parser.add_argument(
-        "--jax-dtype",
+        "--dtype",
         type=str,
         default="float64",
-        help="Floating point precision for the JAX model (default: float64).",
-    )
-    parser.add_argument(
-        "--torch-dtype",
-        type=str,
-        default="float64",
-        help="Floating point precision for the Torch model (default: float64).",
+        help="Floating point precision for both Torch and JAX models (default: float64).",
     )
     parser.add_argument(
         "--device",
@@ -200,9 +194,9 @@ def _forward_torch(model, batch):
 def main() -> None:
     args = _parse_args()
 
-    torch_dtype = getattr(torch, args.torch_dtype, None)
+    torch_dtype = getattr(torch, args.dtype, None)
     if torch_dtype is None:
-        raise ValueError(f"Unsupported Torch dtype: {args.torch_dtype}")
+        raise ValueError(f"Unsupported Torch dtype: {args.dtype}")
     device = torch.device(args.device)
 
     torch_model = torch.load(
@@ -218,7 +212,7 @@ def main() -> None:
             torch_model.atomic_energies_fn.atomic_energies = energies.to(torch_dtype)
     torch_model = torch_model.eval()
 
-    bundle = load_model_bundle(str(args.jax_model), dtype=args.jax_dtype)
+    bundle = load_model_bundle(str(args.jax_model), dtype=args.dtype)
 
     atomic_numbers = _extract_atomic_numbers(torch_model, bundle)
     r_max = _extract_r_max(torch_model, bundle)

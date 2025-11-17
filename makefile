@@ -1,6 +1,6 @@
 
 all: models/mace_jax_bundle
-	python scripts/compare_mace_torch_jax.py --torch-model models/mace_foundation.pt --jax-model models/mace_jax_bundle/ --data-dir data/mptraj --torch-dtype float32
+	python scripts/compare_mace_torch_jax.py --torch-model models/mace_foundation.pt --jax-model models/mace_jax_bundle/ --data-dir data/mptraj --dtype float32
 
 models/mace_jax_bundle: models/mace_foundation.pt
 	rm -rf $@
