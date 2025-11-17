@@ -112,14 +112,14 @@ def main() -> None:
         if 'irreps' in key.lower():
             config[key] = _format_irreps(value)
 
-    jax_model, jax_params, jax_state = mace_torch2jax.convert_model(torch_model, config)
+    jax_model, jax_params, _template = mace_torch2jax.convert_model(
+        torch_model, config
+    )
 
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     (output_dir / 'params.msgpack').write_bytes(serialization.to_bytes(jax_params))
-    if jax_state is not None:
-        (output_dir / 'state.msgpack').write_bytes(serialization.to_bytes(jax_state))
 
     (output_dir / 'config.json').write_text(json.dumps(_sanitize(config), indent=2))
 
