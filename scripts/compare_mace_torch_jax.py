@@ -234,7 +234,7 @@ def main() -> None:
         for h5_path in h5_files:
             loader = _build_loader(h5_path, z_table, r_max, args.batch_size)
             for batch_id, batch in enumerate(
-                tqdm(loader, desc=f'compare {h5_path.name}', leave=False)
+                tqdm(loader, desc=f"compare {h5_path.name}", leave=False)
             ):
                 batch = batch.to(device)
                 batch = _cast_batch(batch, torch_dtype)

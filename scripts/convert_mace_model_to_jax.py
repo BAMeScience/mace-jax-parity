@@ -39,8 +39,9 @@ except ImportError:  # pragma: no cover
     TorchIrreps = None
 
 from flax import serialization
-from mace.tools.scripts_utils import extract_config_mace_model
 from mace_jax.cli import mace_torch2jax
+
+from mace.tools.scripts_utils import extract_config_mace_model
 
 
 def _sanitize(obj):
@@ -55,31 +56,31 @@ def _sanitize(obj):
         return {str(k): _sanitize(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [_sanitize(v) for v in obj]
-    if hasattr(obj, 'tolist'):
+    if hasattr(obj, "tolist"):
         try:
             return obj.tolist()
         except Exception:  # pragma: no cover - best effort conversion
             pass
-    if hasattr(obj, '__name__'):
+    if hasattr(obj, "__name__"):
         return obj.__name__
     return str(obj)
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description='Convert a Torch MACE model checkpoint to a MACE-JAX bundle.'
+        description="Convert a Torch MACE model checkpoint to a MACE-JAX bundle."
     )
     parser.add_argument(
-        '--torch-model',
+        "--torch-model",
         type=Path,
         required=True,
-        help='Path to the serialized torch.nn.Module produced by Equitrain or the helper script.',
+        help="Path to the serialized torch.nn.Module produced by Equitrain or the helper script.",
     )
     parser.add_argument(
-        '--output-dir',
+        "--output-dir",
         type=Path,
-        default=Path('tmp/mace_jax_bundle'),
-        help='Directory where the params/state/config artifacts will be written.',
+        default=Path("tmp/mace_jax_bundle"),
+        help="Directory where the params/state/config artifacts will be written.",
     )
     return parser.parse_args()
 
@@ -101,30 +102,28 @@ def _format_irreps(value):
 def main() -> None:
     args = _parse_args()
 
-    torch_model = torch.load(args.torch_model, map_location='cpu')
+    torch_model = torch.load(args.torch_model, map_location="cpu")
     torch_model = torch_model.float().eval()
 
     config = extract_config_mace_model(torch_model)
-    config['torch_model_class'] = torch_model.__class__.__name__
+    config["torch_model_class"] = torch_model.__class__.__name__
 
     # Ensure irreps are serialized in the textual form expected by mace-jax.
     for key, value in list(config.items()):
-        if 'irreps' in key.lower():
+        if "irreps" in key.lower():
             config[key] = _format_irreps(value)
 
-    jax_model, jax_params, _template = mace_torch2jax.convert_model(
-        torch_model, config
-    )
+    jax_model, jax_params, _template = mace_torch2jax.convert_model(torch_model, config)
 
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    (output_dir / 'params.msgpack').write_bytes(serialization.to_bytes(jax_params))
+    (output_dir / "params.msgpack").write_bytes(serialization.to_bytes(jax_params))
 
-    (output_dir / 'config.json').write_text(json.dumps(_sanitize(config), indent=2))
+    (output_dir / "config.json").write_text(json.dumps(_sanitize(config), indent=2))
 
-    print(f'Exported MACE-JAX artifacts to {output_dir}')
+    print(f"Exported MACE-JAX artifacts to {output_dir}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

@@ -11,8 +11,7 @@ Example
     python scripts/benchmark_mace_torch_vs_jax.py \\
         --torch-model models/mace_foundation.pt \\
         --jax-model models/mace_jax_bundle \\
-        --torch-device cuda \\
-        --jax-platform gpu \\
+        --device gpu \\
         --dtype float32
 """
 
@@ -83,16 +82,13 @@ def _parse_args() -> argparse.Namespace:
         help="Floating point precision to enforce for both models (default: float32).",
     )
     parser.add_argument(
-        "--torch-device",
+        "--device",
         type=str,
         default="cpu",
-        help="Device for the Torch model/data (e.g., cpu or cuda).",
-    )
-    parser.add_argument(
-        "--jax-platform",
-        type=str,
-        default="cpu",
-        help="JAX platform to target (cpu/gpu).",
+        help=(
+            "Device for both Torch and JAX (cpu/gpu/cuda/cuda:0). "
+            "Values starting with 'gpu' are treated as CUDA."
+        ),
     )
     parser.add_argument(
         "--max-batches",
@@ -101,6 +97,19 @@ def _parse_args() -> argparse.Namespace:
         help="Optionally cap the number of batches processed for quick smoke tests.",
     )
     return parser.parse_args()
+
+
+def _resolve_devices(spec: str) -> tuple[torch.device, str]:
+    """Interpret the CLI device flag for Torch and infer the JAX platform."""
+    text = spec.strip()
+    lower = text.lower()
+    if lower.startswith("gpu"):
+        torch_spec = "cuda" + text[3:]
+    else:
+        torch_spec = text
+    device = torch.device(torch_spec)
+    platform = "gpu" if device.type == "cuda" else "cpu"
+    return device, platform
 
 
 def _get_batch_value(batch: Batch, key: str):
@@ -314,7 +323,7 @@ def main() -> None:
     if torch_dtype is None:
         raise ValueError(f"Unsupported dtype: {args.dtype}")
 
-    device = torch.device(args.torch_device)
+    device, jax_platform = _resolve_devices(args.device)
 
     torch_model = torch.load(
         args.torch_model,
@@ -330,7 +339,7 @@ def main() -> None:
     torch_model = torch_model.eval()
 
     jax, jnp, bundle = _load_jax_bundle(
-        args.jax_model, dtype=args.dtype, platform=args.jax_platform
+        args.jax_model, dtype=args.dtype, platform=jax_platform
     )
 
     atomic_numbers = _extract_atomic_numbers(torch_model, bundle)
@@ -383,7 +392,7 @@ def main() -> None:
     )
 
     print(
-        f"JAX [{args.dtype}] on {args.jax_platform}: "
+        f"JAX [{args.dtype}] on {jax_platform}: "
         f"{jax_graphs} graphs across {jax_batches} batches "
         f"in {jax_time:.3f}s => {_throughput(jax_graphs, jax_time):.2f} graphs/s"
     )
