@@ -7,9 +7,9 @@ configuration.
 
 Example
 -------
-    python tmp/convert_mace_model_to_jax.py \\
-        --torch-model tmp/mace_mp_medium.pt \\
-        --output-dir tmp/mace_mp_medium_jax
+    python scripts/convert_mace_model_to_jax.py \\
+        --torch-model models/mace_mp_medium.pt \\
+        --output-dir models/mace_mp_medium_jax
 """
 
 from __future__ import annotations
@@ -79,7 +79,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("tmp/mace_jax_bundle"),
+        default=Path("models/mace_jax_bundle"),
         help="Directory where the params/state/config artifacts will be written.",
     )
     return parser.parse_args()

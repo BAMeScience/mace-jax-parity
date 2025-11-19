@@ -6,10 +6,10 @@ foundation checkpoints.  The resulting ``.pt`` file contains a regular
 
 Example
 -------
-    python tmp/create_mace_foundation_model.py \\
+    python scripts/create_mace_foundation_model.py \\
         --family mp \\
         --model medium-mpa-0 \\
-        --output tmp/mace_mp_medium.pt
+        --output models/mace_mp_medium.pt
 """
 
 from __future__ import annotations
@@ -115,7 +115,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("tmp/mace_foundation.pt"),
+        default=Path("models/mace_foundation.pt"),
         help="Destination file for the serialized torch.nn.Module.",
     )
     return parser.parse_args()
