@@ -9,6 +9,7 @@ energy discrepancy above the configured tolerance.
 from __future__ import annotations
 
 import argparse
+import csv
 from pathlib import Path
 
 import jax
@@ -89,6 +90,12 @@ def _parse_args() -> argparse.Namespace:
         type=str,
         default="cpu",
         help="Device for the Torch model/data (default: cpu).",
+    )
+    parser.add_argument(
+        "--diff-csv",
+        type=Path,
+        default=Path("energy_diffs.csv"),
+        help="Write per-graph energy differences to the given CSV path (default: energy_diffs.csv).",
     )
     return parser.parse_args()
 
@@ -229,50 +236,77 @@ def main() -> None:
     total_graphs = 0
     max_diff = 0.0
     flagged = False
+    diff_count = 0
+    diff_file = None
+    diff_writer = None
+    if args.diff_csv is not None:
+        diff_path = args.diff_csv
+        diff_path.parent.mkdir(parents=True, exist_ok=True)
+        diff_file = diff_path.open("w", newline="")
+        diff_writer = csv.writer(diff_file)
+        diff_writer.writerow(
+            ["file", "graph_index", "batch_id", "delta_e", "torch_energy", "jax_energy"]
+        )
 
-    with torch.no_grad():
-        for h5_path in h5_files:
-            loader = _build_loader(h5_path, z_table, r_max, args.batch_size)
-            for batch_id, batch in enumerate(
-                tqdm(loader, desc=f"compare {h5_path.name}", leave=False)
-            ):
-                batch = batch.to(device)
-                batch = _cast_batch(batch, torch_dtype)
+    try:
+        with torch.no_grad():
+            for h5_path in h5_files:
+                loader = _build_loader(h5_path, z_table, r_max, args.batch_size)
+                for batch_id, batch in enumerate(
+                    tqdm(loader, desc=f"compare {h5_path.name}", leave=False)
+                ):
+                    batch = batch.to(device)
+                    batch = _cast_batch(batch, torch_dtype)
 
-                torch_pred = _extract_energy(_forward_torch(torch_model, batch))
-                energy_torch = torch_pred.detach().cpu().numpy()
+                    torch_pred = _extract_energy(_forward_torch(torch_model, batch))
+                    energy_torch = torch_pred.detach().cpu().numpy()
 
-                batch_jax = _batch_to_jax(batch)
-                jax_pred = bundle.module.apply(
-                    bundle.params,
-                    batch_jax,
-                    compute_force=False,
-                    compute_stress=False,
-                )
-                energy_jax = np.asarray(jax_pred["energy"])
-
-                if energy_torch.shape != energy_jax.shape:
-                    raise RuntimeError(
-                        f"Energy shape mismatch: Torch {energy_torch.shape} vs JAX {energy_jax.shape}"
+                    batch_jax = _batch_to_jax(batch)
+                    jax_pred = bundle.module.apply(
+                        bundle.params,
+                        batch_jax,
+                        compute_force=False,
+                        compute_stress=False,
                     )
+                    energy_jax = np.asarray(jax_pred["energy"])
 
-                total_graphs += energy_torch.shape[0]
-                diff = np.abs(energy_torch - energy_jax)
-                batch_max = float(diff.max(initial=0.0))
-                max_diff = max(max_diff, batch_max)
+                    if energy_torch.shape != energy_jax.shape:
+                        raise RuntimeError(
+                            f"Energy shape mismatch: Torch {energy_torch.shape} vs JAX {energy_jax.shape}"
+                        )
 
-                if batch_max > args.energy_tol:
-                    flagged = True
+                    total_graphs += energy_torch.shape[0]
+                    diff = np.abs(energy_torch - energy_jax)
+                    batch_max = float(diff.max(initial=0.0))
+                    max_diff = max(max_diff, batch_max)
+
                     indices = _graph_indices(batch, len(diff))
                     for idx, delta, e_t, e_j in zip(
                         indices, diff, energy_torch, energy_jax
                     ):
                         if delta > args.energy_tol:
+                            flagged = True
                             tqdm.write(
                                 f"[WARN] {h5_path.name} graph #{idx} batch {batch_id}: "
                                 f"|ΔE|={delta:.3e} eV exceeds tol {args.energy_tol:.1e} "
                                 f"(torch={e_t:.6f}, jax={e_j:.6f})"
                             )
+                        if diff_writer is not None:
+                            diff_writer.writerow(
+                                [
+                                    h5_path.name,
+                                    int(idx),
+                                    int(batch_id),
+                                    float(delta),
+                                    float(e_t),
+                                    float(e_j),
+                                ]
+                            )
+                            diff_file.flush()
+                            diff_count += 1
+    finally:
+        if diff_file is not None:
+            diff_file.close()
 
     print(
         f"Compared {total_graphs} graphs across {len(h5_files)} files. Max |ΔE|={max_diff:.3e} eV"
@@ -286,6 +320,8 @@ def main() -> None:
             f"⚠️ Energy discrepancies exceeded {args.energy_tol:.1e} eV. "
             "See warnings above for affected graphs."
         )
+    if diff_writer is not None and args.diff_csv is not None:
+        print(f"Wrote {diff_count} discrepancy rows to {args.diff_csv}")
 
 
 if __name__ == "__main__":
