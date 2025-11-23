@@ -77,7 +77,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=24,
+        default=18,
         help="Batch size for the PyG DataLoader (default: 8).",
     )
     parser.add_argument(
@@ -134,20 +134,6 @@ def _parse_args() -> argparse.Namespace:
         "--write-graph-cache",
         action="store_true",
         help="When loading torch/PyG batches, store generated graphs into the HDF5 graph_cache dataset.",
-    )
-    parser.add_argument(
-        "--bucket-edges",
-        type=str,
-        default=None,
-        help="Comma-separated edge caps to bucket JAX graphs (e.g., 6000,12000). "
-        "Each bucket is padded to its cap; graphs exceeding all caps are dropped.",
-    )
-    parser.add_argument(
-        "--bucket-nodes",
-        type=str,
-        default=None,
-        help="Comma-separated node caps to bucket JAX graphs (e.g., 128,256). "
-        "Used with bucket-edges to form (node, edge) buckets.",
     )
     parser.add_argument(
         "--max-edges-per-batch",
@@ -900,7 +886,6 @@ def main() -> None:
             f"observed_max_nodes={observed_nodes}, observed_max_edges={observed_edges})"
         )
 
-    bucket_loaders = []
     if args.max_edges_per_batch:
         packed_batches = _pack_by_edges(
             jax_graphs_list,
@@ -913,7 +898,7 @@ def main() -> None:
             f"max_edges_per_batch={args.max_edges_per_batch}, "
             f"max_nodes_per_batch={args.max_nodes_per_batch}"
         )
-        bucket_loaders.append(("packed", packed_batches, 0, 0, 0))
+        jax_loads = [("packed", packed_batches, 0)]
     else:
         from equitrain.data.backend_jax import build_loader
 
@@ -936,7 +921,7 @@ def main() -> None:
             pad_total_nodes=worst_nodes + 1,
             pad_total_edges=worst_edges + 1,
         )
-        bucket_loaders.append(("all_graphs", loader, observed_nodes, observed_edges, 0))
+        jax_loads = [("all_graphs", loader, 0)]
 
     jax_wall_start = time.perf_counter()
     jax_wall_time = 0.0
@@ -945,7 +930,7 @@ def main() -> None:
     ) = 0
     first_batch_graphs = None
     jax_shape_hits: dict[tuple[int, int, int], int] = {}
-    for bucket_id, loader, pad_nodes, pad_edges, dropped in bucket_loaders:
+    for load_id, loader, dropped in jax_loads:
         if loader is None:
             continue
         graph_source = "list" if isinstance(loader, list) else "loader"
@@ -953,8 +938,7 @@ def main() -> None:
             len(loader) if isinstance(loader, list) else getattr(loader, "_n_graph", 0)
         )
         print(
-            f"Running JAX bucket {bucket_id}: pad_nodes={pad_nodes}, pad_edges={pad_edges}, "
-            f"graphs={graph_count}, dropped={dropped} (source={graph_source})"
+            f"Running JAX load {load_id}: graphs={graph_count}, dropped={dropped} (source={graph_source})"
         )
         (
             b_graphs,
