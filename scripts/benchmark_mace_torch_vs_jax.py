@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import multiprocessing as mp
 import os
 import time
 from pathlib import Path
@@ -26,7 +27,6 @@ from pathlib import Path
 import jraph
 import numpy as np
 import torch
-import multiprocessing as mp
 from torch_geometric.data import Batch
 from torch_geometric.loader import DataLoader as PyGDataLoader
 from tqdm import tqdm
@@ -112,17 +112,6 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Optional cap on edges per padded JAX batch (drops oversize graphs when used).",
-    )
-    parser.add_argument(
-        "--drop-oversize",
-        action="store_true",
-        help="Drop graphs that exceed --max-nodes/--max-edges instead of padding to their size.",
-    )
-    parser.add_argument(
-        "--stream-jax",
-        action="store_true",
-        help="Stream HDF5 -> JAX graphs on the fly (avoids holding all graphs in memory). "
-        "Requires --max-nodes/--max-edges to bound padding.",
     )
     parser.add_argument(
         "--max-edges-per-batch",
@@ -261,12 +250,11 @@ def _prepare_jax_graphs(
     *,
     max_nodes: int | None = None,
     max_edges: int | None = None,
-    drop_oversize: bool = False,
 ):
     """
     Load HDF5 structures into jraph.GraphsTuple objects and build a padded loader.
     """
-    from equitrain.data.backend_jax import atoms_to_graphs, build_loader
+    from equitrain.data.backend_jax import atoms_to_graphs
 
     graphs = []
     target_graphs = None if max_batches is None else max_batches * batch_size
@@ -281,7 +269,7 @@ def _prepare_jax_graphs(
     observed_nodes = max((int(g.n_node.sum()) for g in graphs), default=0)
     observed_edges = max((int(g.n_edge.sum()) for g in graphs), default=0)
 
-    if drop_oversize and (max_nodes is not None or max_edges is not None):
+    if max_nodes is not None or max_edges is not None:
         filtered = []
         for g in graphs:
             nodes = int(g.n_node.sum())
@@ -295,109 +283,6 @@ def _prepare_jax_graphs(
         graphs = filtered
 
     return graphs, observed_nodes, observed_edges, dropped_graphs
-
-
-def _build_streaming_jax_loader(
-    h5_files: list[Path],
-    z_table: AtomicNumberTable,
-    r_max: float,
-    batch_size: int,
-    *,
-    max_nodes: int,
-    max_edges: int,
-    max_batches: int | None,
-    drop_oversize: bool,
-):
-    """
-    Stream graphs from HDF5 -> JAX batches without holding all graphs in memory.
-    """
-    import jraph
-
-    from equitrain.data.backend_jax.atoms_to_graphs import graph_from_configuration
-    from equitrain.data.configuration import Configuration as EqConfiguration
-    from equitrain.data.format_hdf5.dataset import HDF5Dataset
-
-    if max_nodes is None or max_edges is None:
-        raise ValueError("Streaming JAX loader requires --max-nodes and --max-edges.")
-
-    class _StreamingLoader:
-        def __init__(self):
-            self._n_node = max_nodes
-            self._n_edge = max_edges
-            self._n_graph = batch_size
-
-        def __iter__(self):
-            dropped = 0
-            emitted_batches = 0
-            current = []
-            nodes = 0
-            edges = 0
-
-            def _flush():
-                nonlocal current, nodes, edges, emitted_batches
-                if not current:
-                    return None
-                batched = current[0] if len(current) == 1 else jraph.batch_np(current)
-                padded = jraph.pad_with_graphs(
-                    batched,
-                    n_node=max_nodes,
-                    n_edge=max_edges,
-                    n_graph=batch_size,
-                )
-                current = []
-                nodes = 0
-                edges = 0
-                emitted_batches += 1
-                return padded
-
-            for h5_path in h5_files:
-                ds = HDF5Dataset(h5_path, mode="r")
-                try:
-                    for idx in range(len(ds)):
-                        atoms = ds[idx]
-                        conf = EqConfiguration.from_atoms(atoms)
-                        graph = graph_from_configuration(
-                            conf, cutoff=r_max, z_table=z_table
-                        )
-                        g_nodes = int(graph.n_node.sum())
-                        g_edges = int(graph.n_edge.sum())
-                        if drop_oversize and (
-                            g_nodes > max_nodes or g_edges > max_edges
-                        ):
-                            dropped += 1
-                            continue
-                        if current and (
-                            len(current) >= batch_size
-                            or nodes + g_nodes > max_nodes
-                            or edges + g_edges > max_edges
-                        ):
-                            batch = _flush()
-                            if batch is not None:
-                                yield batch
-                                if (
-                                    max_batches is not None
-                                    and emitted_batches >= max_batches
-                                ):
-                                    print(
-                                        f"Streaming JAX loader dropped {dropped} graphs (oversize)."
-                                    )
-                                    return
-                        current.append(graph)
-                        nodes += g_nodes
-                        edges += g_edges
-                    # End h5 file
-                finally:
-                    ds.close()
-            final_batch = _flush()
-            if final_batch is not None:
-                yield final_batch
-            if dropped:
-                print(
-                    f"Streaming JAX loader dropped {dropped} graphs exceeding "
-                    f"max_nodes={max_nodes} or max_edges={max_edges}."
-                )
-
-    return _StreamingLoader()
 
 
 def _pack_by_edges(
@@ -537,8 +422,6 @@ def _benchmark_torch(
 ):
     wall_start = time.perf_counter()
     total_graphs = 0
-    total_time = 0.0
-    prep_time = 0.0
     batches_seen = 0
 
     sync = (
@@ -558,29 +441,24 @@ def _benchmark_torch(
             )
             for batch in tqdm(loader, desc=f"Torch {h5_path.name}", leave=True):
                 if max_batches is not None and batches_seen >= max_batches:
-                    return total_graphs, total_time, batches_seen, prep_time
+                    return total_graphs, batches_seen, wall_start
 
-                prep_start = time.perf_counter()
                 batch = batch.to(device)
                 batch = _cast_batch(batch, dtype)
-                prep_time += time.perf_counter() - prep_start
 
                 if sync:
                     sync()
-                start = time.perf_counter()
                 pred = _forward_torch(model, batch)
                 energy = _extract_energy(pred)
                 energy = energy.detach()
                 if sync:
                     sync()
-                step_time = time.perf_counter() - start
 
                 total_graphs += energy.shape[0]
-                total_time += step_time
                 batches_seen += 1
 
     wall_time = time.perf_counter() - wall_start
-    return total_graphs, total_time, batches_seen, prep_time, wall_time
+    return total_graphs, batches_seen, wall_time
 
 
 def _benchmark_jax(
@@ -764,48 +642,30 @@ def main() -> None:
         raise FileNotFoundError(f"No HDF5 files found under {args.data_dir}")
 
     prep_start = time.perf_counter()
-    if args.stream_jax:
-        jax_loader = _build_streaming_jax_loader(
-            h5_files,
-            z_table,
-            r_max,
-            args.batch_size,
-            max_nodes=args.max_nodes,
-            max_edges=args.max_edges,
-            max_batches=args.max_batches,
-            drop_oversize=args.drop_oversize,
-        )
+    (
+        jax_graphs_list,
+        observed_nodes,
+        observed_edges,
+        dropped_graphs,
+    ) = _prepare_jax_graphs(
+        h5_files,
+        z_table,
+        r_max,
+        args.batch_size,
+        args.max_batches,
+        max_nodes=args.max_nodes,
+        max_edges=args.max_edges,
+    )
+    if dropped_graphs:
         print(
-            f"JAX streaming loader: graphs={jax_loader._n_graph}, "
-            f"nodes={jax_loader._n_node}, edges={jax_loader._n_edge}"
+            f"WARNING: Dropped {dropped_graphs} graphs exceeding "
+            f"max_nodes={args.max_nodes} or max_edges={args.max_edges}."
         )
-        jax_graphs_list = []  # not materialized
-    else:
-        (
-            jax_graphs_list,
-            observed_nodes,
-            observed_edges,
-            dropped_graphs,
-        ) = _prepare_jax_graphs(
-            h5_files,
-            z_table,
-            r_max,
-            args.batch_size,
-            args.max_batches,
-            max_nodes=args.max_nodes,
-            max_edges=args.max_edges,
-            drop_oversize=args.drop_oversize,
-        )
-        if dropped_graphs:
-            print(
-                f"WARNING: Dropped {dropped_graphs} graphs exceeding "
-                f"max_nodes={args.max_nodes} or max_edges={args.max_edges}."
-            )
-        print(
-            f"Built JAX graphs/loader in {time.perf_counter() - prep_start:.2f}s "
-            f"({len(jax_graphs_list)} graphs loaded, "
-            f"observed_max_nodes={observed_nodes}, observed_max_edges={observed_edges})"
-        )
+    print(
+        f"Built JAX graphs/loader in {time.perf_counter() - prep_start:.2f}s "
+        f"({len(jax_graphs_list)} graphs loaded, "
+        f"observed_max_nodes={observed_nodes}, observed_max_edges={observed_edges})"
+    )
 
     jax_loads = []
     if args.max_edges_per_batch:
@@ -923,9 +783,7 @@ def main() -> None:
 
     (
         torch_graphs,
-        torch_time,
         torch_batches,
-        torch_prep,
         torch_wall_time,
     ) = _benchmark_torch(
         torch_model,
@@ -940,12 +798,6 @@ def main() -> None:
 
     def _throughput(graphs, elapsed):
         return graphs / elapsed if elapsed and graphs else 0.0
-
-    steadystate_time = None
-    steadystate_graphs = None
-    if jax_compile is not None and jax_batches > 1:
-        steadystate_time = jax_time - jax_compile
-        steadystate_graphs = jax_graphs - (first_batch_graphs or 0)
 
     print(
         f"Torch [{args.dtype}] on {device}: "
@@ -962,12 +814,6 @@ def main() -> None:
     )
     if jax_compile is not None:
         print(f"JAX compile+first-step time: {jax_compile:.3f}s")
-    if steadystate_time is not None and steadystate_graphs is not None:
-        print(
-            f"JAX steady-state: {steadystate_graphs} graphs "
-            f"in {steadystate_time:.3f}s => "
-            f"{_throughput(steadystate_graphs, steadystate_time):.2f} graphs/s"
-        )
 
 
 if __name__ == "__main__":
