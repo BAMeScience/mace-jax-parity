@@ -31,7 +31,6 @@ import torch
 
 # Torch 2.6 tightened torch.load defaults; the checkpoints still store ``slice``.
 from torch.serialization import add_safe_globals
-from torch_geometric.data import Batch
 from torch_geometric.loader import DataLoader as PyGDataLoader
 from tqdm import tqdm
 
@@ -148,28 +147,6 @@ def _resolve_devices(spec: str) -> tuple[torch.device, str]:
     return device, platform
 
 
-def _get_batch_value(batch: Batch, key: str):
-    try:
-        return batch[key]
-    except (AttributeError, KeyError, TypeError):
-        return getattr(batch, key)
-
-
-def _set_batch_value(batch: Batch, key: str, value):
-    try:
-        batch[key] = value
-    except (AttributeError, KeyError, TypeError):
-        setattr(batch, key, value)
-
-
-def _cast_batch(batch: Batch, dtype):
-    for key in batch.keys():
-        value = _get_batch_value(batch, key)
-        if isinstance(value, torch.Tensor) and value.dtype.is_floating_point:
-            _set_batch_value(batch, key, value.to(dtype))
-    return batch
-
-
 def _extract_atomic_numbers(torch_model, jax_bundle):
     if hasattr(torch_model, "atomic_numbers"):
         numbers = getattr(torch_model, "atomic_numbers")
@@ -198,16 +175,6 @@ def _extract_r_max(torch_model, jax_bundle):
     if config_value is not None:
         return float(config_value)
     raise RuntimeError("Unable to infer r_max from the provided models.")
-
-
-def _extract_energy(pred):
-    if isinstance(pred, dict):
-        if "energy" not in pred:
-            raise RuntimeError("Torch model output dict lacks `energy` key.")
-        return pred["energy"]
-    if isinstance(pred, (list, tuple)):
-        return pred[0]
-    return pred
 
 
 def _build_loader(
@@ -409,14 +376,12 @@ def _benchmark_torch(
                 if max_batches is not None and batches_seen >= max_batches:
                     return total_graphs, batches_seen, wall_start
 
-                batch = batch.to(device)
-                batch = _cast_batch(batch, dtype)
+                batch = batch.to(device=device)
 
                 if sync:
                     sync()
                 pred = _forward_torch(model, batch)
-                energy = _extract_energy(pred)
-                energy = energy.detach()
+                energy = pred["energy"].detach()
                 if sync:
                     sync()
 
@@ -592,31 +557,34 @@ def main() -> None:
 
     device, jax_platform = _resolve_devices(args.device)
 
-    torch_model = torch.load(
-        args.torch_model,
-        map_location=device,
-        weights_only=False,
-    )
-    torch_model = torch_model.to(device=device)
-    torch_model = torch_model.to(dtype=torch_dtype)
-    if hasattr(torch_model, "atomic_energies_fn"):
-        energies = getattr(torch_model.atomic_energies_fn, "atomic_energies", None)
-        if isinstance(energies, torch.Tensor):
-            torch_model.atomic_energies_fn.atomic_energies = energies.to(torch_dtype)
-    torch_model = torch_model.eval()
+    def _load_torch_model() -> torch.nn.Module:
+        model = torch.load(
+            args.torch_model,
+            map_location=device,
+            weights_only=False,
+        )
+        model = model.to(device=device, dtype=torch_dtype).eval()
+        if hasattr(model, "atomic_energies_fn"):
+            energies = getattr(model.atomic_energies_fn, "atomic_energies", None)
+            if isinstance(energies, torch.Tensor):
+                model.atomic_energies_fn.atomic_energies = energies.to(torch_dtype)
+        return model
 
+    def _list_h5_files() -> list[Path]:
+        files = sorted(args.data_dir.glob("*.h5"))
+        if args.split != "all":
+            files = [p for p in files if p.stem == args.split]
+        if not files:
+            raise FileNotFoundError(f"No HDF5 files found under {args.data_dir}")
+        return files
+
+    torch_model = _load_torch_model()
     bundle = _load_jax_bundle(args.jax_model, dtype=args.dtype, platform=jax_platform)
 
     atomic_numbers = _extract_atomic_numbers(torch_model, bundle)
     r_max = _extract_r_max(torch_model, bundle)
-
     z_table = AtomicNumberTable(atomic_numbers)
-
-    h5_files = sorted(args.data_dir.glob("*.h5"))
-    if args.split != "all":
-        h5_files = [p for p in h5_files if p.stem == args.split]
-    if not h5_files:
-        raise FileNotFoundError(f"No HDF5 files found under {args.data_dir}")
+    h5_files = _list_h5_files()
 
     prep_start = time.perf_counter()
     (
