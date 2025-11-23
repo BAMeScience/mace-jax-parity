@@ -18,6 +18,7 @@ Example
 from __future__ import annotations
 
 import argparse
+import itertools
 import os
 import pickle
 import time
@@ -76,7 +77,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=8,
+        default=24,
         help="Batch size for the PyG DataLoader (default: 8).",
     )
     parser.add_argument(
@@ -149,18 +150,10 @@ def _parse_args() -> argparse.Namespace:
         "Used with bucket-edges to form (node, edge) buckets.",
     )
     parser.add_argument(
-        "--bucket-count",
-        type=int,
-        default=None,
-        help="If bucket caps are not provided, automatically derive this many buckets "
-        "from data quantiles (nodes and edges). Default uses 3 quantiles.",
-    )
-    parser.add_argument(
         "--max-edges-per-batch",
         type=int,
         default=None,
-        help="Optional hard cap on total edges per JAX batch (greedy packing). "
-        "When set, buckets are bypassed and batches are formed by filling up to this edge limit.",
+        help="Optional hard cap on total edges per JAX batch (greedy packing).",
     )
     parser.add_argument(
         "--max-nodes-per-batch",
@@ -204,63 +197,6 @@ def _cast_batch(batch: Batch, dtype):
         if isinstance(value, torch.Tensor) and value.dtype.is_floating_point:
             _set_batch_value(batch, key, value.to(dtype))
     return batch
-
-
-def _batch_signature(batch: Batch) -> tuple[int, int, int]:
-    """Return a coarse signature (graphs, atoms, edges) for a PyG batch."""
-    try:
-        positions = _get_batch_value(batch, "positions") or _get_batch_value(
-            batch, "pos"
-        )
-    except Exception:
-        positions = None
-
-    try:
-        edge_index = _get_batch_value(batch, "edge_index")
-    except Exception:
-        edge_index = None
-
-    graphs = -1
-    atoms = -1
-    edges = -1
-
-    if positions is not None and hasattr(positions, "shape"):
-        try:
-            atoms = int(positions.shape[0])
-        except Exception:
-            atoms = -1
-
-    if edge_index is not None and hasattr(edge_index, "shape"):
-        try:
-            edges = int(edge_index.shape[1])
-        except Exception:
-            edges = -1
-
-    batch_vec = getattr(batch, "batch", None)
-    if batch_vec is not None:
-        try:
-            graphs = int(batch_vec.max().item()) + 1
-        except Exception:
-            try:
-                graphs = int(len(batch.ptr) - 1)
-            except Exception:
-                graphs = -1
-
-    return graphs, atoms, edges
-
-
-def _batch_to_jax(batch: Batch, jax, jnp_dtype):
-    data_dict = {}
-    for key in batch.keys():
-        value = _get_batch_value(batch, key)
-        if isinstance(value, torch.Tensor):
-            array = value.detach().cpu().numpy()
-            if array.dtype.kind == "f":
-                array = array.astype(jnp_dtype)
-            data_dict[key] = jax.device_put(array)
-        else:
-            data_dict[key] = value
-    return data_dict
 
 
 def _extract_atomic_numbers(torch_model, jax_bundle):
@@ -561,159 +497,6 @@ def _build_streaming_jax_loader(
     return _StreamingLoader()
 
 
-def _bucket_graphs(
-    graphs: list,
-    *,
-    bucket_edges: list[int] | None,
-    max_nodes: int | None,
-    bucket_nodes: list[int] | None,
-) -> tuple[list[tuple[str, list, int, int]], int]:
-    """
-    Assign graphs to (node_cap, edge_cap) buckets. Returns (buckets, dropped_total).
-    Each bucket entry: (bucket_id, graphs_in_bucket, pad_nodes, pad_edges).
-    """
-    if not graphs:
-        return [], 0
-    if not bucket_edges and not bucket_nodes:
-        cap_edges = max(int(g.n_edge.sum()) for g in graphs)
-        cap_nodes = max(int(g.n_node.sum()) for g in graphs)
-        if max_nodes is not None:
-            cap_nodes = min(cap_nodes, max_nodes)
-        return [("bucket_all", list(graphs), cap_nodes, cap_edges)], 0
-
-    edge_caps = sorted(bucket_edges) if bucket_edges else []
-    node_caps = sorted(bucket_nodes) if bucket_nodes else []
-    if not edge_caps:
-        edge_caps = [max(int(g.n_edge.sum()) for g in graphs)]
-    if not node_caps:
-        node_caps = [max(int(g.n_node.sum()) for g in graphs)]
-    buckets_grid = [(ncap, ecap) for ncap in node_caps for ecap in edge_caps]
-    bucket_lists: list[list] = [[] for _ in buckets_grid]
-    dropped = 0
-    for g in graphs:
-        edges = int(g.n_edge.sum())
-        nodes = int(g.n_node.sum())
-        placed = False
-        for idx, (ncap, ecap) in enumerate(buckets_grid):
-            if (
-                edges <= ecap
-                and nodes <= ncap
-                and (max_nodes is None or nodes <= max_nodes)
-            ):
-                bucket_lists[idx].append(g)
-                placed = True
-                break
-        if not placed:
-            dropped += 1
-    buckets: list[tuple[str, list, int, int]] = []
-    for (ncap, ecap), glist in zip(buckets_grid, bucket_lists):
-        if not glist:
-            continue
-        cap_nodes = min(ncap, max_nodes) if max_nodes is not None else ncap
-        buckets.append((f"nodes<={ncap}_edges<={ecap}", glist, cap_nodes, ecap))
-    return buckets, dropped
-
-
-def _auto_bucket_by_edges(
-    graphs: list, max_nodes: int | None, bucket_count: int | None
-):
-    """
-    Derive buckets by splitting graphs into roughly equal groups by edge count.
-    Each bucket cap is the max nodes/edges observed in that bucket.
-    """
-    if not graphs:
-        return []
-    count = bucket_count if bucket_count and bucket_count > 0 else 3
-    count = max(count, 1)
-    edges = np.array([int(g.n_edge.sum()) for g in graphs], dtype=np.int64)
-    order = np.argsort(edges)
-    buckets = []
-    splits = np.linspace(0, len(graphs), num=count + 1, dtype=int)
-    for i in range(count):
-        idx = order[splits[i] : splits[i + 1]]
-        if idx.size == 0:
-            continue
-        glist = [graphs[j] for j in idx]
-        cap_edges = int(max(edges[idx]))
-        cap_nodes = max(int(g.n_node.sum()) for g in glist)
-        if max_nodes is not None:
-            cap_nodes = min(cap_nodes, max_nodes)
-        buckets.append((f"auto_bucket_{i}", glist, cap_nodes, cap_edges, 0))
-    return buckets
-
-
-def _auto_bucket_caps(
-    graphs: list, max_nodes: int | None, max_edges: int | None, bucket_count: int | None
-):
-    """
-    Derive coarse node/edge caps from quantiles (compatibility helper for CLI printout).
-    """
-    if not graphs:
-        return None, None
-    nodes = np.array([int(g.n_node.sum()) for g in graphs], dtype=np.int64)
-    edges = np.array([int(g.n_edge.sum()) for g in graphs], dtype=np.int64)
-    count = bucket_count if bucket_count and bucket_count > 1 else 3
-    quantiles = np.linspace(0.0, 1.0, num=count, endpoint=True).tolist()
-    node_caps = [int(np.ceil(np.quantile(nodes, q))) for q in quantiles]
-    edge_caps = [int(np.ceil(np.quantile(edges, q))) for q in quantiles]
-    node_caps.append(int(nodes.max()))
-    edge_caps.append(int(edges.max()))
-    if max_nodes is not None:
-        node_caps = [min(c, max_nodes) for c in node_caps]
-    if max_edges is not None:
-        edge_caps = [min(c, max_edges) for c in edge_caps]
-    node_caps = sorted({c for c in node_caps if c > 0})
-    edge_caps = sorted({c for c in edge_caps if c > 0})
-    return node_caps or None, edge_caps or None
-
-
-def _build_bucket_loaders(
-    graphs: list,
-    *,
-    bucket_edges: list[int] | None,
-    bucket_nodes: list[int] | None,
-    max_nodes: int | None,
-    drop_oversize: bool,
-    batch_size: int,
-    bucket_count: int | None = None,
-):
-    from equitrain.data.backend_jax import build_loader
-
-    dropped_total = 0
-    if bucket_edges is None and bucket_nodes is None:
-        buckets = _auto_bucket_by_edges(
-            graphs, max_nodes=max_nodes, bucket_count=bucket_count
-        )
-    else:
-        buckets, dropped_total = _bucket_graphs(
-            graphs,
-            bucket_edges=bucket_edges,
-            bucket_nodes=bucket_nodes,
-            max_nodes=max_nodes,
-        )
-    loaders = []
-    for bucket_id, bucket_graphs, cap_nodes, cap_edges in buckets:
-        # Fixed padding per bucket based on worst-case actual batch (sum of largest graphs).
-        node_counts = sorted((int(g.n_node.sum()) for g in bucket_graphs), reverse=True)
-        edge_counts = sorted((int(g.n_edge.sum()) for g in bucket_graphs), reverse=True)
-        worst_nodes = sum(node_counts[:batch_size]) if node_counts else 0
-        worst_edges = sum(edge_counts[:batch_size]) if edge_counts else 0
-        loader = build_loader(
-            bucket_graphs,
-            batch_size=batch_size,
-            shuffle=False,
-            max_nodes=cap_nodes,
-            max_edges=cap_edges,
-            drop=drop_oversize,
-            force_padding=True,
-            pad_total_nodes=worst_nodes + 1,  # +1 for padding graph
-            pad_total_edges=worst_edges + 1,
-        )
-        loaders.append((bucket_id, loader, cap_nodes, cap_edges, dropped_total))
-        dropped_total = 0  # report total only once
-    return loaders
-
-
 def _pack_by_edges(
     graphs: list,
     *,
@@ -747,12 +530,8 @@ def _pack_by_edges(
         batches.append(current)
     # Build fixed padding based on worst-case batch sums.
     max_graphs = max((len(b) for b in batches), default=0)
-    max_nodes = max(
-        (sum(int(g.n_node.sum()) for g in b) for b in batches), default=0
-    )
-    max_edges = max(
-        (sum(int(g.n_edge.sum()) for g in b) for b in batches), default=0
-    )
+    max_nodes = max((sum(int(g.n_node.sum()) for g in b) for b in batches), default=0)
+    max_edges = max((sum(int(g.n_edge.sum()) for g in b) for b in batches), default=0)
     pad_graphs = max_graphs + 1 if max_graphs else 1
     pad_nodes = max_nodes + 1 if max_nodes else 1
     pad_edges = max_edges + 1 if max_edges else 1
@@ -819,8 +598,10 @@ def _setup_jax(platform: str, enable_x64: bool):
 def _load_jax_bundle(bundle_path: Path, dtype: str, platform: str):
     # If no compilation cache is configured, create one alongside the bundle.
     if not os.environ.get("JAX_COMPILATION_CACHE_DIR"):
-        cache_dir = Path(bundle_path).with_suffix("").with_name(
-            f"{Path(bundle_path).name}_cache"
+        cache_dir = (
+            Path(bundle_path)
+            .with_suffix("")
+            .with_name(f"{Path(bundle_path).name}_cache")
         )
         cache_dir.mkdir(parents=True, exist_ok=True)
         os.environ["JAX_COMPILATION_CACHE_DIR"] = str(cache_dir)
@@ -865,7 +646,7 @@ def _benchmark_torch(
                 drop_last=False,
                 cache_graphs=cache_graphs,
             )
-            for batch in tqdm(loader, desc=f"Torch {h5_path.name}", leave=False):
+            for batch in tqdm(loader, desc=f"Torch {h5_path.name}", leave=True):
                 if max_batches is not None and batches_seen >= max_batches:
                     return total_graphs, total_time, batches_seen, prep_time
 
@@ -939,18 +720,52 @@ def _benchmark_jax(
             else:
                 yield item
 
+    batch_iter = _iter_batches(graphs_loader)
+    first_batch = next(batch_iter, None)
+
+    # Warmup compile on first batch (excluded from totals).
+    if warmup_compile and first_batch is not None:
+        mask = np.asarray(jraph.get_graph_padding_mask(first_batch))
+        real_graphs = int(np.sum(mask))
+        convert_start = time.perf_counter()
+        warm_batch_jax = _graph_to_jax_data(
+            first_batch, num_species=num_species, jnp=jnp, jax=jax, jnp_dtype=jnp_dtype
+        )
+        convert_time += time.perf_counter() - convert_start
+        warm_start = time.perf_counter()
+        pred = jit_apply(
+            bundle.params,
+            warm_batch_jax,
+            compute_force=False,
+            compute_stress=False,
+        )
+        energy = pred["energy"]
+        if hasattr(energy, "block_until_ready"):
+            energy.block_until_ready()
+        compile_time = time.perf_counter() - warm_start
+        first_batch_graphs = real_graphs
+        tqdm.write(f"[JAX] Compile finished in {compile_time:.3f}s for first shape")
+
     total_batches = None
     try:
         total_batches = len(graphs_loader)
     except Exception:
         total_batches = None
 
-    for graph in tqdm(
-        _iter_batches(graphs_loader),
+    chained_iter = (
+        itertools.chain([first_batch], batch_iter)
+        if first_batch is not None
+        else batch_iter
+    )
+
+    pbar = tqdm(
+        chained_iter,
         desc="JAX graphs",
         leave=True,
         total=total_batches,
-    ):
+    )
+
+    for graph in pbar:
         if max_batches is not None and batches_seen >= max_batches:
             break
 
@@ -962,36 +777,15 @@ def _benchmark_jax(
         signature = (num_graphs, num_nodes, num_edges)
         shape_hits[signature] = shape_hits.get(signature, 0) + 1
         if shape_hits[signature] == 1 and len(shape_hits) <= 5:
-            print(
+            pbar.write(
                 f"[JAX] Padded batch shape graphs={num_graphs} atoms={num_nodes} edges={num_edges} (will trigger XLA compile)"
             )
 
-        # Optional warmup to exclude compile time from benchmark totals.
-        batch_jax = None
-        if compile_time is None and warmup_compile:
-            convert_start = time.perf_counter()
-            batch_jax = _graph_to_jax_data(
-                graph, num_species=num_species, jnp=jnp, jax=jax, jnp_dtype=jnp_dtype
-            )
-            warm_start = time.perf_counter()
-            pred = jit_apply(
-                bundle.params,
-                batch_jax,
-                compute_force=False,
-                compute_stress=False,
-            )
-            energy = pred["energy"]
-            if hasattr(energy, "block_until_ready"):
-                energy.block_until_ready()
-            compile_time = time.perf_counter() - warm_start
-            first_batch_graphs = real_graphs
-            print(f"[JAX] Compile finished in {compile_time:.3f}s for first shape")
-        if batch_jax is None:
-            convert_start = time.perf_counter()
-            batch_jax = _graph_to_jax_data(
-                graph, num_species=num_species, jnp=jnp, jax=jax, jnp_dtype=jnp_dtype
-            )
-            convert_time += time.perf_counter() - convert_start
+        convert_start = time.perf_counter()
+        batch_jax = _graph_to_jax_data(
+            graph, num_species=num_species, jnp=jnp, jax=jax, jnp_dtype=jnp_dtype
+        )
+        convert_time += time.perf_counter() - convert_start
 
         start = time.perf_counter()
         pred = jit_apply(
@@ -1106,56 +900,43 @@ def main() -> None:
             f"observed_max_nodes={observed_nodes}, observed_max_edges={observed_edges})"
         )
 
+    bucket_loaders = []
     if args.max_edges_per_batch:
         packed_batches = _pack_by_edges(
             jax_graphs_list,
             max_edges_per_batch=args.max_edges_per_batch,
             max_nodes_per_batch=args.max_nodes_per_batch,
-            batch_size_limit=None,  # no fixed batch size when packing by edges
+            batch_size_limit=None,
         )
         print(
             f"Greedy edge-packed batches: {len(packed_batches)} batches, "
             f"max_edges_per_batch={args.max_edges_per_batch}, "
             f"max_nodes_per_batch={args.max_nodes_per_batch}"
         )
-        bucket_loaders = [("packed", packed_batches, 0, 0, 0)]
+        bucket_loaders.append(("packed", packed_batches, 0, 0, 0))
     else:
-        bucket_edges = None
-        if args.bucket_edges:
-            try:
-                bucket_edges = sorted(
-                    {int(x.strip()) for x in args.bucket_edges.split(",") if x.strip()}
-                )
-            except Exception:
-                bucket_edges = None
-        bucket_nodes = None
-        if args.bucket_nodes:
-            try:
-                bucket_nodes = sorted(
-                    {int(x.strip()) for x in args.bucket_nodes.split(",") if x.strip()}
-                )
-            except Exception:
-                bucket_nodes = None
-        if bucket_edges is None and bucket_nodes is None:
-            bucket_nodes, bucket_edges = _auto_bucket_caps(
-                jax_graphs_list,
-                max_nodes=args.max_nodes,
-                max_edges=args.max_edges,
-                bucket_count=args.bucket_count,
-            )
-            print(
-                f"Auto bucket caps nodes={bucket_nodes} edges={bucket_edges} "
-                f"(derived from dataset quantiles, count={args.bucket_count or 3})"
-            )
-        bucket_loaders = _build_bucket_loaders(
-            jax_graphs_list,
-            bucket_edges=bucket_edges,
-            bucket_nodes=bucket_nodes,
-            max_nodes=args.max_nodes,
-            drop_oversize=args.drop_oversize,
-            batch_size=args.batch_size,
-            bucket_count=args.bucket_count,
+        from equitrain.data.backend_jax import build_loader
+
+        node_counts = sorted(
+            (int(g.n_node.sum()) for g in jax_graphs_list), reverse=True
         )
+        edge_counts = sorted(
+            (int(g.n_edge.sum()) for g in jax_graphs_list), reverse=True
+        )
+        worst_nodes = sum(node_counts[: args.batch_size]) if node_counts else 0
+        worst_edges = sum(edge_counts[: args.batch_size]) if edge_counts else 0
+        loader = build_loader(
+            jax_graphs_list,
+            batch_size=args.batch_size,
+            shuffle=False,
+            max_nodes=observed_nodes,
+            max_edges=observed_edges,
+            drop=False,
+            force_padding=True,
+            pad_total_nodes=worst_nodes + 1,
+            pad_total_edges=worst_edges + 1,
+        )
+        bucket_loaders.append(("all_graphs", loader, observed_nodes, observed_edges, 0))
 
     jax_wall_start = time.perf_counter()
     jax_wall_time = 0.0
@@ -1168,7 +949,9 @@ def main() -> None:
         if loader is None:
             continue
         graph_source = "list" if isinstance(loader, list) else "loader"
-        graph_count = len(loader) if isinstance(loader, list) else getattr(loader, "_n_graph", 0)
+        graph_count = (
+            len(loader) if isinstance(loader, list) else getattr(loader, "_n_graph", 0)
+        )
         print(
             f"Running JAX bucket {bucket_id}: pad_nodes={pad_nodes}, pad_edges={pad_edges}, "
             f"graphs={graph_count}, dropped={dropped} (source={graph_source})"
@@ -1235,47 +1018,18 @@ def main() -> None:
         steadystate_graphs = jax_graphs - (first_batch_graphs or 0)
 
     print(
-        f"Torch prep (to device + cast): {torch_prep:.3f}s total "
-        f"({(torch_prep / torch_batches) if torch_batches else 0:.4f}s/batch)"
-    )
-    print(
         f"Torch [{args.dtype}] on {device}: "
         f"{torch_graphs} graphs across {torch_batches} batches "
-        f"in {torch_time:.3f}s compute / {torch_wall_time:.3f}s wall => "
-        f"{_throughput(torch_graphs, torch_time):.2f} graphs/s compute | "
-        f"{_throughput(torch_graphs, torch_wall_time):.2f} graphs/s wall"
+        f"in {torch_wall_time:.3f}s (wall, includes all prep/compute) => "
+        f"{_throughput(torch_graphs, torch_wall_time):.2f} graphs/s"
     )
 
-    print(
-        f"JAX host->device conversion: {jax_convert_time:.3f}s total "
-        f"({(jax_convert_time / jax_batches) if jax_batches else 0:.4f}s/batch)"
-    )
-    print(
-        f"JAX apply (jit+compute): {jax_apply_time:.3f}s total "
-        f"({(jax_apply_time / jax_batches) if jax_batches else 0:.4f}s/batch)"
-    )
-    jax_compute_total = jax_apply_time + jax_convert_time
     print(
         f"JAX [{args.dtype}] on {jax_platform}: "
         f"{jax_graphs} graphs across {jax_batches} batches "
-        f"in {jax_time:.3f}s compute_apply / {jax_compute_total:.3f}s compute+convert / "
-        f"{jax_wall_time:.3f}s wall => "
-        f"{_throughput(jax_graphs, jax_time):.2f} graphs/s apply | "
-        f"{_throughput(jax_graphs, jax_compute_total):.2f} graphs/s compute+convert | "
-        f"{_throughput(jax_graphs, jax_wall_time):.2f} graphs/s wall"
+        f"in {jax_wall_time:.3f}s (wall, includes compile) => "
+        f"{_throughput(jax_graphs, jax_wall_time):.2f} graphs/s"
     )
-    if jax_shape_hits:
-        top_shapes = sorted(jax_shape_hits.items(), key=lambda kv: kv[1], reverse=True)[
-            :5
-        ]
-        shape_text = "; ".join(
-            f"(g={g}, a={a}, e={e})x{count}" for (g, a, e), count in top_shapes
-        )
-        print(
-            f"JAX batch shape variants (graphs, atoms, edges): "
-            f"{len(jax_shape_hits)} unique (top: {shape_text})"
-        )
-
     if jax_compile is not None:
         print(f"JAX compile+first-step time: {jax_compile:.3f}s")
     if steadystate_time is not None and steadystate_graphs is not None:
