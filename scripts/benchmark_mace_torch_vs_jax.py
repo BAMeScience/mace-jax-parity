@@ -20,10 +20,8 @@ from __future__ import annotations
 import argparse
 import itertools
 import os
-import pickle
 import time
 from pathlib import Path
-from typing import Iterable
 
 import jraph
 import numpy as np
@@ -121,21 +119,10 @@ def _parse_args() -> argparse.Namespace:
         help="Drop graphs that exceed --max-nodes/--max-edges instead of padding to their size.",
     )
     parser.add_argument(
-        "--graphs-cache",
-        type=Path,
-        default=None,
-        help="Optional path to cache prebuilt JAX graphs (pickle). Speeds up repeated runs.",
-    )
-    parser.add_argument(
         "--stream-jax",
         action="store_true",
         help="Stream HDF5 -> JAX graphs on the fly (avoids holding all graphs in memory). "
         "Requires --max-nodes/--max-edges to bound padding.",
-    )
-    parser.add_argument(
-        "--write-graph-cache",
-        action="store_true",
-        help="When loading torch/PyG batches, store generated graphs into the HDF5 graph_cache dataset.",
     )
     parser.add_argument(
         "--max-edges-per-batch",
@@ -241,24 +228,12 @@ def _build_loader(
     batch_size: int,
     *,
     drop_last: bool = False,
-    cache_graphs: bool = False,
 ):
-    if cache_graphs:
-        # Disable HDF5 file locking to avoid contention when appending cache.
-        os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
-
-    cache_path = None
-    if cache_graphs:
-        h5p = Path(h5_path)
-        cache_path = h5p.with_name(f"{h5p.stem}_cache{h5p.suffix}")
-
     def _open_dataset() -> HDF5GraphDataset:
         return HDF5GraphDataset(
             h5_path,
             r_max=r_max,
             atomic_numbers=z_table,
-            cache_graphs=cache_graphs,
-            cache_path=cache_path,
         )
 
     try:
@@ -272,34 +247,9 @@ def _build_loader(
         )
         dataset = _open_dataset()
 
-    if cache_graphs:
-        _populate_graph_cache(dataset)
     return PyGDataLoader(
         dataset, batch_size=batch_size, shuffle=False, drop_last=drop_last
     )
-
-
-def _populate_graph_cache(dataset: HDF5GraphDataset):
-    """Populate missing graph_cache entries with a tqdm progress bar."""
-    cache_ds = getattr(dataset, "_get_cache_dataset", lambda: None)()
-    if cache_ds is None:
-        return
-    missing_indices = []
-    for idx in range(len(dataset)):
-        try:
-            entry = cache_ds[idx]
-            if entry is None or len(entry) == 0:
-                missing_indices.append(idx)
-        except Exception:
-            missing_indices.append(idx)
-    if not missing_indices:
-        return
-
-    print(
-        f"Caching {len(missing_indices)} graphs into graph_cache for {dataset._filename}"
-    )
-    for idx in tqdm(missing_indices, desc="Caching HDF5 graphs", leave=False):
-        _ = dataset[idx]
 
 
 def _prepare_jax_graphs(
@@ -312,39 +262,11 @@ def _prepare_jax_graphs(
     max_nodes: int | None = None,
     max_edges: int | None = None,
     drop_oversize: bool = False,
-    cache_path: Path | None = None,
 ):
     """
     Load HDF5 structures into jraph.GraphsTuple objects and build a padded loader.
     """
     from equitrain.data.backend_jax import atoms_to_graphs, build_loader
-
-    if cache_path is not None and cache_path.exists():
-        try:
-            cached = pickle.loads(cache_path.read_bytes())
-            graphs = cached.get("graphs", [])
-            cached_obs_nodes = cached.get("observed_nodes", 0)
-            cached_obs_edges = cached.get("observed_edges", 0)
-            dropped_graphs = cached.get("dropped_graphs", 0)
-            print(
-                f"Loaded {len(graphs)} cached graphs from {cache_path} "
-                f"(max_nodes={cached_obs_nodes}, max_edges={cached_obs_edges}, "
-                f"dropped={dropped_graphs})."
-            )
-            loader = build_loader(
-                graphs,
-                batch_size=batch_size,
-                shuffle=False,
-                max_nodes=max_nodes,
-                max_edges=max_edges,
-                drop=drop_oversize,
-                force_padding=True,
-            )
-            return graphs, loader, cached_obs_nodes, cached_obs_edges, dropped_graphs
-        except Exception as exc:
-            print(
-                f"Warning: failed to load cache {cache_path}: {exc}. Rebuilding graphs."
-            )
 
     graphs = []
     target_graphs = None if max_batches is None else max_batches * batch_size
@@ -371,20 +293,6 @@ def _prepare_jax_graphs(
                 continue
             filtered.append(g)
         graphs = filtered
-
-    if cache_path is not None:
-        try:
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            cache_payload = dict(
-                graphs=graphs,
-                observed_nodes=observed_nodes,
-                observed_edges=observed_edges,
-                dropped_graphs=dropped_graphs,
-            )
-            cache_path.write_bytes(pickle.dumps(cache_payload))
-            print(f"Saved {len(graphs)} graphs to cache at {cache_path}.")
-        except Exception as exc:
-            print(f"Warning: failed to save cache {cache_path}: {exc}.")
 
     return graphs, observed_nodes, observed_edges, dropped_graphs
 
@@ -626,7 +534,6 @@ def _benchmark_torch(
     dtype,
     device,
     max_batches,
-    cache_graphs: bool = False,
 ):
     wall_start = time.perf_counter()
     total_graphs = 0
@@ -648,7 +555,6 @@ def _benchmark_torch(
                 r_max,
                 batch_size,
                 drop_last=False,
-                cache_graphs=cache_graphs,
             )
             for batch in tqdm(loader, desc=f"Torch {h5_path.name}", leave=True):
                 if max_batches is not None and batches_seen >= max_batches:
@@ -889,7 +795,6 @@ def main() -> None:
             max_nodes=args.max_nodes,
             max_edges=args.max_edges,
             drop_oversize=args.drop_oversize,
-            cache_path=args.graphs_cache,
         )
         if dropped_graphs:
             print(
@@ -1031,7 +936,6 @@ def main() -> None:
         torch_dtype,
         device,
         args.max_batches,
-        cache_graphs=args.write_graph_cache,
     )
 
     def _throughput(graphs, elapsed):
