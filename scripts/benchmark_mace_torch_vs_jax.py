@@ -20,28 +20,28 @@ from __future__ import annotations
 import argparse
 import itertools
 import multiprocessing as mp
-import os
 import time
 from pathlib import Path
 
+import jax
+import jax.numpy as jnp
 import jraph
 import numpy as np
 import torch
+
+# Torch 2.6 tightened torch.load defaults; the checkpoints still store ``slice``.
+from torch.serialization import add_safe_globals
 from torch_geometric.data import Batch
 from torch_geometric.loader import DataLoader as PyGDataLoader
 from tqdm import tqdm
 
-# Torch 2.6 tightened torch.load defaults; the checkpoints still store ``slice``.
-try:  # pragma: no cover - defensive guard for torch<2.6
-    from torch.serialization import add_safe_globals
-except ImportError:  # pragma: no cover
-    add_safe_globals = None
-
-if callable(add_safe_globals):  # pragma: no cover - guard for torch<2.6
-    add_safe_globals([slice])
-
+from equitrain.backends.jax_utils import load_model_bundle
 from equitrain.data.atomic import AtomicNumberTable
+from equitrain.data.backend_jax import atoms_to_graphs
+from equitrain.data.backend_jax.atoms_to_graphs import graph_to_data
 from equitrain.data.format_hdf5 import HDF5GraphDataset
+
+add_safe_globals([slice])
 
 
 def _parse_args() -> argparse.Namespace:
@@ -116,8 +116,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-edges-per-batch",
         type=int,
-        default=None,
-        help="Optional hard cap on total edges per JAX batch (greedy packing).",
+        default=10000,
+        help="Hard cap on total edges per JAX batch (greedy packing).",
     )
     parser.add_argument(
         "--max-nodes-per-batch",
@@ -218,23 +218,11 @@ def _build_loader(
     *,
     drop_last: bool = False,
 ):
-    def _open_dataset() -> HDF5GraphDataset:
-        return HDF5GraphDataset(
-            h5_path,
-            r_max=r_max,
-            atomic_numbers=z_table,
-        )
-
-    try:
-        dataset = _open_dataset()
-    except BlockingIOError as exc:
-        # Force-disable locking and retry once.
-        os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
-        print(
-            f"WARNING: retrying HDF5 open for {h5_path} without file locking "
-            f"due to: {exc}"
-        )
-        dataset = _open_dataset()
+    dataset = HDF5GraphDataset(
+        h5_path,
+        r_max=r_max,
+        atomic_numbers=z_table,
+    )
 
     return PyGDataLoader(
         dataset, batch_size=batch_size, shuffle=False, drop_last=drop_last
@@ -254,8 +242,6 @@ def _prepare_jax_graphs(
     """
     Load HDF5 structures into jraph.GraphsTuple objects and build a padded loader.
     """
-    from equitrain.data.backend_jax import atoms_to_graphs
-
     graphs = []
     target_graphs = None if max_batches is None else max_batches * batch_size
     dropped_graphs = 0
@@ -345,10 +331,8 @@ def _producer_enqueue_batches(batches: list, queue: mp.Queue):
         queue.put(None)
 
 
-def _graph_to_jax_data(graph, num_species: int, jnp, jax, jnp_dtype):
-    from mace_jax.tools.gin_model import _graph_to_data
-
-    data = _graph_to_data(graph, num_species=num_species)
+def _graph_to_jax_data(graph, num_species: int, jnp_dtype):
+    data = graph_to_data(graph, num_species=num_species)
     casted = {}
     for k, v in data.items():
         if hasattr(v, "dtype") and v.dtype.kind == "f":
@@ -360,54 +344,36 @@ def _graph_to_jax_data(graph, num_species: int, jnp, jax, jnp_dtype):
 
 
 def _forward_torch(model, batch):
-    try:
-        return model(batch, compute_force=False, compute_stress=False)
-    except TypeError:
-        return model(batch)
+    return model(batch, compute_force=False, compute_stress=False)
 
 
 def _setup_jax(platform: str, enable_x64: bool):
-    import jax
-
     jax.config.update("jax_platform_name", platform)
     jax.config.update("jax_enable_x64", enable_x64)
-    # Enable persistent compilation cache if the env var is set.
-    cache_dir = os.environ.get("JAX_COMPILATION_CACHE_DIR")
-    if cache_dir:
-        try:
-            import jax.experimental.compilation_cache as cc
-
-            Path(cache_dir).mkdir(parents=True, exist_ok=True)
-            cc.initialize_cache(cache_dir)
-            print(f"JAX compilation cache initialized at {cache_dir}")
-        except Exception as exc:
-            print(f"Warning: failed to initialize JAX compilation cache: {exc}")
     # Favor speed (allow TF32/fast matmul on GPU).
     try:
         jax.config.update("jax_default_matmul_precision", "fastest")
     except Exception:
         pass
-    import jax.numpy as jnp  # type: ignore
-
-    return jax, jnp
+    return None
 
 
 def _load_jax_bundle(bundle_path: Path, dtype: str, platform: str):
-    # If no compilation cache is configured, create one alongside the bundle.
-    if not os.environ.get("JAX_COMPILATION_CACHE_DIR"):
-        cache_dir = (
-            Path(bundle_path)
-            .with_suffix("")
-            .with_name(f"{Path(bundle_path).name}_cache")
-        )
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        os.environ["JAX_COMPILATION_CACHE_DIR"] = str(cache_dir)
+    cache_dir = Path(bundle_path) / ".cache"
+    Path(cache_dir).mkdir(parents=True, exist_ok=True)
+    jax.config.update("jax_compilation_cache_dir", str(cache_dir))
+    jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+    jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+    jax.config.update(
+        "jax_persistent_cache_enable_xla_caches",
+        "xla_gpu_per_fusion_autotune_cache_dir",
+    )
+    print(f"JAX compilation cache configured at {cache_dir}")
 
-    jax, jnp = _setup_jax(platform, enable_x64=dtype == "float64")
-    from equitrain.backends.jax_utils import load_model_bundle
+    _setup_jax(platform, enable_x64=dtype == "float64")
 
     bundle = load_model_bundle(str(bundle_path), dtype=dtype)
-    return jax, jnp, bundle
+    return bundle
 
 
 def _benchmark_torch(
@@ -465,14 +431,37 @@ def _benchmark_jax(
     jax,
     jnp,
     bundle,
-    graphs_loader,
+    graphs,
     num_species,
     dtype,
     max_batches,
     *,
-    warmup_compile: bool = True,
-    total_override: int | None = None,
+    max_edges_per_batch: int,
+    max_nodes_per_batch: int | None,
+    prefetch_batches: int = 0,
 ):
+    def _maybe_prefetch(source, total_batches: int | None):
+        """Optionally prefetch batches in a background process."""
+        if prefetch_batches and prefetch_batches > 0:
+            ctx = mp.get_context("spawn")
+            q: mp.Queue = ctx.Queue(maxsize=prefetch_batches)
+            proc = ctx.Process(
+                target=_producer_enqueue_batches,
+                args=(source, q),
+                daemon=True,
+            )
+            proc.start()
+
+            def _queue_iter():
+                while True:
+                    item = q.get()
+                    if item is None:
+                        break
+                    yield item
+
+            return _queue_iter(), total_batches, "packed_prefetch"
+        return source, total_batches, "packed"
+
     wall_start = time.perf_counter()
     jnp_dtype = jnp.dtype(dtype)
     jit_apply = jax.jit(
@@ -481,25 +470,36 @@ def _benchmark_jax(
     )
 
     total_graphs = 0
-    total_time = 0.0
-    convert_time = 0.0
-    apply_time = 0.0
     batches_seen = 0
     compile_time = None
-    first_batch_graphs = None
     shape_hits: dict[tuple[int, int, int], int] = {}
 
-    if graphs_loader is None:
-        return (
-            total_graphs,
-            total_time,
-            batches_seen,
-            compile_time,
-            first_batch_graphs,
-            convert_time,
-            apply_time,
-            shape_hits,
-        )
+    if graphs is None:
+        return total_graphs, batches_seen, compile_time, wall_start
+
+    packed_batches = _pack_by_edges(
+        graphs,
+        max_edges_per_batch=max_edges_per_batch,
+        max_nodes_per_batch=max_nodes_per_batch,
+        batch_size_limit=None,
+    )
+    print(
+        f"Greedy edge-packed batches: {len(packed_batches)} batches, "
+        f"max_edges_per_batch={max_edges_per_batch}, "
+        f"max_nodes_per_batch={max_nodes_per_batch}"
+    )
+
+    total_batches = len(packed_batches)
+
+    graphs_loader, total_batches, load_id = _maybe_prefetch(
+        packed_batches, total_batches
+    )
+
+    print(
+        f"Running JAX load {load_id}: batches={total_batches}, "
+        f"max_edges_per_batch={max_edges_per_batch}, "
+        f"max_nodes_per_batch={max_nodes_per_batch}"
+    )
 
     def _iter_batches(loader):
         for item in loader:
@@ -513,14 +513,12 @@ def _benchmark_jax(
     first_batch = next(batch_iter, None)
 
     # Warmup compile on first batch (excluded from totals).
-    if warmup_compile and first_batch is not None:
+    if first_batch is not None:
         mask = np.asarray(jraph.get_graph_padding_mask(first_batch))
         real_graphs = int(np.sum(mask))
-        convert_start = time.perf_counter()
         warm_batch_jax = _graph_to_jax_data(
-            first_batch, num_species=num_species, jnp=jnp, jax=jax, jnp_dtype=jnp_dtype
+            first_batch, num_species=num_species, jnp_dtype=jnp_dtype
         )
-        convert_time += time.perf_counter() - convert_start
         warm_start = time.perf_counter()
         pred = jit_apply(
             bundle.params,
@@ -532,10 +530,7 @@ def _benchmark_jax(
         if hasattr(energy, "block_until_ready"):
             energy.block_until_ready()
         compile_time = time.perf_counter() - warm_start
-        first_batch_graphs = real_graphs
         tqdm.write(f"[JAX] Compile finished in {compile_time:.3f}s for first shape")
-
-    total_batches = total_override if total_override is not None else len(graphs_loader)
 
     chained_iter = (
         itertools.chain([first_batch], batch_iter)
@@ -567,13 +562,10 @@ def _benchmark_jax(
                 f"[JAX] Padded batch shape graphs={num_graphs} atoms={num_nodes} edges={num_edges} (will trigger XLA compile)"
             )
 
-        convert_start = time.perf_counter()
         batch_jax = _graph_to_jax_data(
-            graph, num_species=num_species, jnp=jnp, jax=jax, jnp_dtype=jnp_dtype
+            graph, num_species=num_species, jnp_dtype=jnp_dtype
         )
-        convert_time += time.perf_counter() - convert_start
 
-        start = time.perf_counter()
         pred = jit_apply(
             bundle.params,
             batch_jax,
@@ -583,25 +575,12 @@ def _benchmark_jax(
         energy = pred["energy"]
         if hasattr(energy, "block_until_ready"):
             energy.block_until_ready()
-        step_time = time.perf_counter() - start
 
         total_graphs += real_graphs
-        total_time += step_time
-        apply_time += step_time
         batches_seen += 1
 
     wall_time = time.perf_counter() - wall_start
-    return (
-        total_graphs,
-        total_time,
-        batches_seen,
-        compile_time,
-        first_batch_graphs,
-        convert_time,
-        apply_time,
-        shape_hits,
-        wall_time,
-    )
+    return total_graphs, batches_seen, compile_time, wall_time
 
 
 def main() -> None:
@@ -626,9 +605,7 @@ def main() -> None:
             torch_model.atomic_energies_fn.atomic_energies = energies.to(torch_dtype)
     torch_model = torch_model.eval()
 
-    jax, jnp, bundle = _load_jax_bundle(
-        args.jax_model, dtype=args.dtype, platform=jax_platform
-    )
+    bundle = _load_jax_bundle(args.jax_model, dtype=args.dtype, platform=jax_platform)
 
     atomic_numbers = _extract_atomic_numbers(torch_model, bundle)
     r_max = _extract_r_max(torch_model, bundle)
@@ -667,119 +644,23 @@ def main() -> None:
         f"observed_max_nodes={observed_nodes}, observed_max_edges={observed_edges})"
     )
 
-    jax_loads = []
-    if args.max_edges_per_batch:
-        packed_batches = _pack_by_edges(
-            jax_graphs_list,
-            max_edges_per_batch=args.max_edges_per_batch,
-            max_nodes_per_batch=args.max_nodes_per_batch,
-            batch_size_limit=None,
-        )
-        print(
-            f"Greedy edge-packed batches: {len(packed_batches)} batches, "
-            f"max_edges_per_batch={args.max_edges_per_batch}, "
-            f"max_nodes_per_batch={args.max_nodes_per_batch}"
-        )
-        if args.prefetch_batches and args.prefetch_batches > 0:
-            ctx = mp.get_context("spawn")
-            q: mp.Queue = ctx.Queue(maxsize=args.prefetch_batches)
-            proc = ctx.Process(
-                target=_producer_enqueue_batches,
-                args=(packed_batches, q),
-                daemon=True,
-            )
-            proc.start()
-
-            def _queue_iter():
-                while True:
-                    item = q.get()
-                    if item is None:
-                        break
-                    yield item
-
-            jax_loads = [("packed_prefetch", _queue_iter(), 0, len(packed_batches))]
-        else:
-            jax_loads = [("packed", packed_batches, 0, len(packed_batches))]
-    else:
-        from equitrain.data.backend_jax import build_loader
-
-        node_counts = sorted(
-            (int(g.n_node.sum()) for g in jax_graphs_list), reverse=True
-        )
-        edge_counts = sorted(
-            (int(g.n_edge.sum()) for g in jax_graphs_list), reverse=True
-        )
-        worst_nodes = sum(node_counts[: args.batch_size]) if node_counts else 0
-        worst_edges = sum(edge_counts[: args.batch_size]) if edge_counts else 0
-        loader = build_loader(
-            jax_graphs_list,
-            batch_size=args.batch_size,
-            shuffle=False,
-            max_nodes=observed_nodes,
-            max_edges=observed_edges,
-            drop=False,
-            force_padding=True,
-            pad_total_nodes=worst_nodes + 1,
-            pad_total_edges=worst_edges + 1,
-        )
-        total_batches = None
-        try:
-            total_batches = len(loader)
-        except Exception:
-            total_batches = None
-        jax_loads = [("all_graphs", loader, 0, total_batches)]
-
-    jax_wall_start = time.perf_counter()
-    jax_wall_time = 0.0
-    jax_graphs = jax_time = jax_batches = jax_compile = jax_convert_time = (
-        jax_apply_time
-    ) = 0
-    first_batch_graphs = None
-    jax_shape_hits: dict[tuple[int, int, int], int] = {}
-    for load_id, loader, dropped, total_batches in jax_loads:
-        if loader is None:
-            continue
-        graph_source = "list" if isinstance(loader, list) else "loader"
-        graph_count = (
-            len(loader) if isinstance(loader, list) else getattr(loader, "_n_graph", 0)
-        )
-        print(
-            f"Running JAX load {load_id}: graphs={graph_count}, dropped={dropped} (source={graph_source})"
-        )
-        (
-            b_graphs,
-            b_time,
-            b_batches,
-            b_compile,
-            b_first_graphs,
-            b_convert_time,
-            b_apply_time,
-            b_shape_hits,
-            b_wall_time,
-        ) = _benchmark_jax(
-            jax,
-            jnp,
-            bundle,
-            loader,
-            len(atomic_numbers),
-            args.dtype,
-            args.max_batches,
-            warmup_compile=True,
-            total_override=total_batches,
-        )
-        jax_graphs += b_graphs
-        jax_time += b_time
-        jax_batches += b_batches
-        jax_convert_time += b_convert_time
-        jax_apply_time += b_apply_time
-        jax_shape_hits.update(b_shape_hits)
-        if first_batch_graphs is None:
-            first_batch_graphs = b_first_graphs
-        if jax_compile is None and b_compile is not None:
-            jax_compile = b_compile
-        jax_wall_time += b_wall_time
-    if jax_wall_time == 0:
-        jax_wall_time = time.perf_counter() - jax_wall_start
+    (
+        jax_graphs,
+        jax_batches,
+        jax_compile,
+        jax_wall_time,
+    ) = _benchmark_jax(
+        jax,
+        jnp,
+        bundle,
+        jax_graphs_list,
+        len(atomic_numbers),
+        args.dtype,
+        args.max_batches,
+        prefetch_batches=args.prefetch_batches,
+        max_edges_per_batch=args.max_edges_per_batch,
+        max_nodes_per_batch=args.max_nodes_per_batch,
+    )
 
     (
         torch_graphs,
