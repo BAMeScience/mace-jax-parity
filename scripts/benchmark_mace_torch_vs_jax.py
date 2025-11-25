@@ -101,18 +101,6 @@ def _parse_args() -> argparse.Namespace:
         help="Optionally cap the number of batches processed for quick smoke tests.",
     )
     parser.add_argument(
-        "--max-nodes",
-        type=int,
-        default=None,
-        help="Optional cap on nodes per padded JAX batch (drops oversize graphs when used).",
-    )
-    parser.add_argument(
-        "--max-edges",
-        type=int,
-        default=None,
-        help="Optional cap on edges per padded JAX batch (drops oversize graphs when used).",
-    )
-    parser.add_argument(
         "--max-edges-per-batch",
         type=int,
         default=10000,
@@ -209,9 +197,6 @@ def _prepare_jax_graphs(
     r_max: float,
     batch_size: int,
     max_batches: int | None,
-    *,
-    max_nodes: int | None = None,
-    max_edges: int | None = None,
 ):
     """
     Load HDF5 structures into jraph.GraphsTuple objects and build a padded loader.
@@ -229,19 +214,6 @@ def _prepare_jax_graphs(
     observed_nodes = max((int(g.n_node.sum()) for g in graphs), default=0)
     observed_edges = max((int(g.n_edge.sum()) for g in graphs), default=0)
 
-    if max_nodes is not None or max_edges is not None:
-        filtered = []
-        for g in graphs:
-            nodes = int(g.n_node.sum())
-            edges = int(g.n_edge.sum())
-            if (max_nodes is not None and nodes > max_nodes) or (
-                max_edges is not None and edges > max_edges
-            ):
-                dropped_graphs += 1
-                continue
-            filtered.append(g)
-        graphs = filtered
-
     return graphs, observed_nodes, observed_edges, dropped_graphs
 
 
@@ -252,14 +224,20 @@ def _pack_by_edges(
     max_nodes_per_batch: int | None,
     batch_size_limit: int | None,
 ):
-    """Greedy pack graphs into batches limited by edge/node counts."""
+    """Greedy pack graphs into batches limited by edge/node counts. Drops oversized graphs."""
     batches: list[list] = []
     current: list = []
     edge_sum = 0
     node_sum = 0
+    dropped = 0
     for g in graphs:
         g_edges = int(g.n_edge.sum())
         g_nodes = int(g.n_node.sum())
+        if g_edges > max_edges_per_batch or (
+            max_nodes_per_batch is not None and g_nodes > max_nodes_per_batch
+        ):
+            dropped += 1
+            continue
         would_edges = edge_sum + g_edges
         would_nodes = node_sum + g_nodes
         if current and (
@@ -293,7 +271,7 @@ def _pack_by_edges(
             n_graph=pad_graphs,
         )
         padded_batches.append(padded)
-    return padded_batches
+    return padded_batches, dropped
 
 
 def _producer_enqueue_batches(batches: list, queue: mp.Queue):
@@ -449,7 +427,7 @@ def _benchmark_jax(
     if graphs is None:
         return total_graphs, batches_seen, compile_time, wall_start
 
-    packed_batches = _pack_by_edges(
+    packed_batches, dropped_graphs = _pack_by_edges(
         graphs,
         max_edges_per_batch=max_edges_per_batch,
         max_nodes_per_batch=max_nodes_per_batch,
@@ -460,6 +438,12 @@ def _benchmark_jax(
         f"max_edges_per_batch={max_edges_per_batch}, "
         f"max_nodes_per_batch={max_nodes_per_batch}"
     )
+    if dropped_graphs:
+        print(
+            f"WARNING: Dropped {dropped_graphs} graphs exceeding "
+            f"max_edges_per_batch={max_edges_per_batch} or "
+            f"max_nodes_per_batch={max_nodes_per_batch}."
+        )
 
     total_batches = len(packed_batches)
 
@@ -605,8 +589,6 @@ def main() -> None:
         r_max,
         args.batch_size,
         args.max_batches,
-        max_nodes=args.max_nodes,
-        max_edges=args.max_edges,
     )
     if dropped_graphs:
         print(
