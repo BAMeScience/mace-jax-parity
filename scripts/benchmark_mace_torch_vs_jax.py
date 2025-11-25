@@ -148,6 +148,13 @@ def _resolve_devices(spec: str) -> tuple[torch.device, str]:
 
 
 def _extract_atomic_numbers(torch_model, jax_bundle):
+    """
+    Resolve the list of atomic numbers to build the AtomicNumberTable used for
+    graph construction and shared by both Torch and JAX runs. We try the Torch
+    checkpoint first (it may store an AtomicNumberTable, tensor, or plain list),
+    then fall back to the JAX bundle config. Failing both, we error because the
+    models would be misconfigured.
+    """
     if hasattr(torch_model, "atomic_numbers"):
         numbers = getattr(torch_model, "atomic_numbers")
         if hasattr(numbers, "zs"):  # AtomicNumberTable
