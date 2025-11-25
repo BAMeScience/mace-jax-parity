@@ -31,7 +31,7 @@ import torch
 
 # Torch 2.6 tightened torch.load defaults; the checkpoints still store ``slice``.
 from torch.serialization import add_safe_globals
-from torch_geometric.loader import DataLoader as PyGDataLoader
+from equitrain.data.backend_torch.loaders_dynamic import DynamicGraphLoader
 from tqdm import tqdm
 
 from equitrain.backends.jax_utils import load_model_bundle
@@ -186,8 +186,17 @@ def _build_loader(
         atomic_numbers=z_table,
     )
 
-    return PyGDataLoader(
-        dataset, batch_size=batch_size, shuffle=False, drop_last=drop_last
+    return DynamicGraphLoader(
+        dataset=dataset,
+        errors=None,
+        batch_size=batch_size,
+        shuffle=False,
+        drop_last=drop_last,
+        pin_memory=False,
+        num_workers=0,
+        max_nodes=None,
+        max_edges=None,
+        drop=False,
     )
 
 
@@ -357,21 +366,32 @@ def _benchmark_torch(
                 batch_size,
                 drop_last=False,
             )
-            for batch in tqdm(loader, desc=f"Torch {h5_path.name}", leave=True):
-                if max_batches is not None and batches_seen >= max_batches:
-                    return total_graphs, batches_seen, wall_start
 
-                batch = batch.to(device=device)
+            pbar = tqdm(total=len(loader), desc=f"Torch {h5_path.name}", leave=True)
 
-                if sync:
-                    sync()
-                pred = _forward_torch(model, batch)
-                energy = pred["energy"].detach()
-                if sync:
-                    sync()
+            for item in loader:
+                batches = item if isinstance(item, list) else [item]
+                if len(batches) > 1:
+                    pbar.total += len(batches) - 1
+                    pbar.refresh()
+                for batch in batches:
+                    if max_batches is not None and batches_seen >= max_batches:
+                        pbar.close()
+                        return total_graphs, batches_seen, wall_start
 
-                total_graphs += energy.shape[0]
-                batches_seen += 1
+                    batch = batch.to(device=device)
+
+                    if sync:
+                        sync()
+                    pred = _forward_torch(model, batch)
+                    energy = pred["energy"].detach()
+                    if sync:
+                        sync()
+
+                    total_graphs += energy.shape[0]
+                    batches_seen += 1
+                    pbar.update(1)
+            pbar.close()
 
     wall_time = time.perf_counter() - wall_start
     return total_graphs, batches_seen, wall_time
