@@ -19,9 +19,11 @@ from __future__ import annotations
 
 import argparse
 import itertools
-import multiprocessing as mp
+import threading
 import time
 from pathlib import Path
+from queue import Queue
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -33,16 +35,15 @@ import torch
 from torch.serialization import add_safe_globals
 from tqdm import tqdm
 
-from equitrain.backends.jax_utils import load_model_bundle
-from equitrain.data.atomic import AtomicNumberTable
-from equitrain.data.backend_jax import pack_graphs_greedy
-from equitrain.data.backend_jax.atoms_to_graphs import (
-    graph_from_configuration,
-    graph_to_data,
+from equitrain.backends.jax_utils import (
+    load_model_bundle,
+    prepare_sharded_batch,
+    replicate_to_local_devices,
 )
-from equitrain.data.backend_torch.loaders_dynamic import DynamicGraphLoader
-from equitrain.data.configuration import Configuration
-from equitrain.data.format_hdf5 import HDF5Dataset, HDF5GraphDataset
+from equitrain.data.atomic import AtomicNumberTable
+from equitrain.data.backend_jax import get_dataloader
+from equitrain.data.backend_jax.atoms_to_graphs import graph_to_data
+from equitrain.data.backend_torch import loaders as torch_loaders
 
 add_safe_globals([slice])
 
@@ -181,76 +182,6 @@ def _extract_r_max(torch_model, jax_bundle):
     raise RuntimeError("Unable to infer r_max from the provided models.")
 
 
-def _build_loader(
-    h5_path: Path,
-    z_table: AtomicNumberTable,
-    r_max: float,
-    batch_size: int,
-    *,
-    drop_last: bool = False,
-):
-    dataset = HDF5GraphDataset(
-        h5_path,
-        r_max=r_max,
-        atomic_numbers=z_table,
-    )
-
-    return DynamicGraphLoader(
-        dataset=dataset,
-        errors=None,
-        batch_size=batch_size,
-        shuffle=False,
-        drop_last=drop_last,
-        pin_memory=False,
-        num_workers=0,
-        max_nodes=None,
-        max_edges=None,
-        drop=False,
-    )
-
-
-def _prepare_jax_graphs(
-    h5_files: list[Path],
-    z_table: AtomicNumberTable,
-    r_max: float,
-    batch_size: int,
-    max_batches: int | None,
-):
-    """
-    Provide a factory that streams HDF5 -> jraph graphs on demand (no full materialization).
-    """
-    target_graphs = None if max_batches is None else max_batches * batch_size
-
-    def _iter_graphs():
-        emitted = 0
-        for h5_path in h5_files:
-            ds = HDF5Dataset(h5_path, mode="r")
-            try:
-                for idx in range(len(ds)):
-                    atoms = ds[idx]
-                    conf = Configuration.from_atoms(atoms)
-                    graph = graph_from_configuration(
-                        conf, cutoff=r_max, z_table=z_table
-                    )
-                    yield graph
-                    emitted += 1
-                    if target_graphs is not None and emitted >= target_graphs:
-                        return
-            finally:
-                ds.close()
-
-    return _iter_graphs
-
-
-def _producer_enqueue_batches(batches: list, queue: mp.Queue):
-    """CPU worker to enqueue prebuilt batches."""
-    try:
-        for b in batches:
-            queue.put(b, block=True)
-    finally:
-        queue.put(None)
-
-
 def _graph_to_jax_data(graph, num_species: int, jnp_dtype):
     data = graph_to_data(graph, num_species=num_species)
     casted = {}
@@ -317,14 +248,26 @@ def _benchmark_torch(
     )
 
     with torch.no_grad():
+        base_args = SimpleNamespace(
+            pin_memory=False,
+            workers=0,
+            batch_size=batch_size,
+            shuffle=False,
+            batch_max_nodes=None,
+            batch_max_edges=None,
+            batch_drop=False,
+            niggli_reduce=False,
+        )
         for h5_path in h5_files:
-            loader = _build_loader(
+            loader = torch_loaders.get_dataloader(
+                base_args,
                 h5_path,
-                z_table,
-                r_max,
-                batch_size,
-                drop_last=False,
+                atomic_numbers=z_table,
+                r_max=r_max,
+                accelerator=None,
             )
+            if loader is None:
+                raise RuntimeError(f"Failed to build Torch loader for {h5_path}")
 
             pbar = tqdm(total=len(loader), desc=f"Torch {h5_path.name}", leave=True)
 
@@ -360,37 +303,36 @@ def _benchmark_jax(
     jax,
     jnp,
     bundle,
-    graphs,
+    loader,
     num_species,
     dtype,
     max_batches,
     *,
-    max_edges_per_batch: int,
-    max_nodes_per_batch: int | None,
     prefetch_batches: int = 0,
     multi_gpu: bool = False,
 ):
     def _maybe_prefetch(source, total_batches: int | None):
-        """Optionally prefetch batches in a background process."""
+        """Optionally prefetch batches in a background thread."""
         if prefetch_batches and prefetch_batches > 0:
-            ctx = mp.get_context("spawn")
-            q: mp.Queue = ctx.Queue(maxsize=prefetch_batches)
-            proc = ctx.Process(
-                target=_producer_enqueue_batches,
-                args=(source, q),
-                daemon=True,
-            )
-            proc.start()
+            queue: Queue = Queue(maxsize=prefetch_batches)
+            sentinel = object()
+
+            def _producer():
+                for item in source:
+                    queue.put(item)
+                queue.put(sentinel)
+
+            threading.Thread(target=_producer, daemon=True).start()
 
             def _queue_iter():
                 while True:
-                    item = q.get()
-                    if item is None:
+                    item = queue.get()
+                    if item is sentinel:
                         break
                     yield item
 
-            return _queue_iter(), total_batches, "packed_prefetch"
-        return source, total_batches, "packed"
+            return _queue_iter(), total_batches, "prefetch_thread"
+        return source, total_batches, "loader_stream"
 
     wall_start = time.perf_counter()
     jnp_dtype = jnp.dtype(dtype)
@@ -409,65 +351,46 @@ def _benchmark_jax(
             axis_name="devices",
             static_argnames=("compute_force", "compute_stress"),
         )
-        params_for_apply = jax.device_put_replicated(bundle.params, jax.local_devices())
+        params_for_apply = replicate_to_local_devices(bundle.params)
 
     total_graphs = 0
     batches_seen = 0
     compile_time = None
     shape_hits: dict[tuple[int, int, int], int] = {}
 
-    if graphs is None:
+    if loader is None:
         return total_graphs, batches_seen, compile_time, wall_start
 
-    def _shard_graph(graph: jraph.GraphsTuple):
-        if not use_pmap:
-            return None
-        graphs_list = list(jraph.unbatch(graph))
-        total = len(graphs_list)
-        if total % num_devices != 0 or total == 0:
-            return None
-        per = total // num_devices
-        shards = []
-        for i in range(num_devices):
-            chunk = graphs_list[i * per : (i + 1) * per]
-            shards.append(jraph.batch_np(chunk))
-        return shards
-
-    packed_batches, pack_info = pack_graphs_greedy(
-        graph_iter_fn=graphs,
-        max_edges_per_batch=max_edges_per_batch,
-        max_nodes_per_batch=max_nodes_per_batch,
-        batch_size_limit=None,
-    )
+    try:
+        total_batches = len(loader)
+    except TypeError:
+        total_batches = None
+    pack_info = getattr(loader, "pack_info", lambda: {})()
     dropped_graphs = pack_info.get("dropped", 0)
-    total_batches = pack_info.get("total_batches", None)
+    pad_graphs = pack_info.get("pad_graphs", "?")
+    pad_nodes = pack_info.get("pad_nodes", "?")
+    pad_edges = pack_info.get("pad_edges", "?")
     print(
-        f"Greedy edge-packed batches: {total_batches} batches, "
-        f"max_edges_per_batch={max_edges_per_batch}, "
-        f"max_nodes_per_batch={max_nodes_per_batch}"
+        f"JAX loader: batches={total_batches}, pad_graphs={pad_graphs}, "
+        f"pad_nodes={pad_nodes}, pad_edges={pad_edges}"
     )
     if dropped_graphs:
         print(
             f"WARNING: Dropped {dropped_graphs} graphs exceeding "
-            f"max_edges_per_batch={max_edges_per_batch} or "
-            f"max_nodes_per_batch={max_nodes_per_batch}."
+            "the configured batch limits."
         )
 
     if prefetch_batches and prefetch_batches > 0:
-        # Materialize for prefetcher
-        packed_list = list(packed_batches)
+        packed_list = list(loader)
+        total_batches = len(packed_list)
         graphs_loader, total_batches, load_id = _maybe_prefetch(
             packed_list, total_batches
         )
     else:
-        graphs_loader = packed_batches
-        load_id = "packed_stream"
+        graphs_loader = loader
+        load_id = "loader_stream"
 
-    print(
-        f"Running JAX load {load_id}: batches={total_batches}, "
-        f"max_edges_per_batch={max_edges_per_batch}, "
-        f"max_nodes_per_batch={max_nodes_per_batch}"
-    )
+    print(f"Running JAX load {load_id}: batches={total_batches}")
 
     def _iter_batches(loader):
         for item in loader:
@@ -482,20 +405,19 @@ def _benchmark_jax(
 
     # Warmup compile on first batch (excluded from totals).
     if first_batch is not None:
-        sharded = _shard_graph(first_batch)
-        if use_pmap and sharded is None:
+        warm_batch_jax = None
+        if use_pmap:
+            try:
+                warm_batch_jax = prepare_sharded_batch(first_batch, num_devices)
+            except ValueError:
+                warm_batch_jax = None
+        if use_pmap and warm_batch_jax is None:
             tqdm.write(
                 "[JAX] Disabling multi-GPU: batch graphs not divisible by device count."
             )
             use_pmap = False
             params_for_apply = bundle.params
-        if use_pmap and sharded is not None:
-            shard_data = [
-                _graph_to_jax_data(s, num_species=num_species, jnp_dtype=jnp_dtype)
-                for s in sharded
-            ]
-            warm_batch_jax = jax.device_put_sharded(shard_data, jax.local_devices())
-        else:
+        if not use_pmap:
             warm_batch_jax = _graph_to_jax_data(
                 first_batch, num_species=num_species, jnp_dtype=jnp_dtype
             )
@@ -552,28 +474,24 @@ def _benchmark_jax(
                 f"[JAX] Padded batch shape graphs={num_graphs} atoms={num_nodes} edges={num_edges} (will trigger XLA compile)"
             )
 
-        shard_data = None
+        batch_jax = None
         if use_pmap:
-            shards = _shard_graph(graph)
-            if shards is None:
+            try:
+                batch_jax = prepare_sharded_batch(graph, num_devices)
+            except ValueError:
+                batch_jax = None
+            if batch_jax is None:
                 pbar.write(
                     "[JAX] Disabling multi-GPU mid-run: batch not divisible by device count."
                 )
                 use_pmap = False
                 params_for_apply = bundle.params
-            else:
-                shard_data = [
-                    _graph_to_jax_data(s, num_species=num_species, jnp_dtype=jnp_dtype)
-                    for s in shards
-                ]
-                batch_jax = jax.device_put_sharded(shard_data, jax.local_devices())
-
         if not use_pmap:
             batch_jax = _graph_to_jax_data(
                 graph, num_species=num_species, jnp_dtype=jnp_dtype
             )
 
-        if use_pmap and pmap_apply is not None and shard_data is not None:
+        if use_pmap and pmap_apply is not None and batch_jax is not None:
             pred = pmap_apply(
                 params_for_apply,
                 batch_jax,
@@ -637,16 +555,21 @@ def main() -> None:
     h5_files = _list_h5_files()
 
     prep_start = time.perf_counter()
-    graph_iter_fn = _prepare_jax_graphs(
-        h5_files,
-        z_table,
-        r_max,
-        args.batch_size,
-        args.max_batches,
+    jax_loader = get_dataloader(
+        data_file=h5_files,
+        atomic_numbers=z_table,
+        r_max=r_max,
+        batch_size=None,
+        shuffle=False,
+        max_nodes=args.max_nodes_per_batch,
+        max_edges=args.max_edges_per_batch,
+        seed=None,
+        niggli_reduce=False,
+        max_batches=args.max_batches,
     )
     print(
-        f"Built JAX graphs/loader in {time.perf_counter() - prep_start:.2f}s "
-        "(streaming iterator from HDF5)"
+        f"Built JAX loader in {time.perf_counter() - prep_start:.2f}s "
+        "(streaming from HDF5)"
     )
 
     (
@@ -658,13 +581,11 @@ def main() -> None:
         jax,
         jnp,
         bundle,
-        graph_iter_fn,
+        jax_loader,
         len(atomic_numbers),
         args.dtype,
         args.max_batches,
         prefetch_batches=args.prefetch_batches,
-        max_edges_per_batch=args.max_edges_per_batch,
-        max_nodes_per_batch=args.max_nodes_per_batch,
         multi_gpu=args.multi_gpu,
     )
 
