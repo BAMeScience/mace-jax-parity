@@ -19,10 +19,8 @@ from __future__ import annotations
 
 import argparse
 import itertools
-import threading
 import time
 from pathlib import Path
-from queue import Queue
 from types import SimpleNamespace
 
 import jax
@@ -308,31 +306,8 @@ def _benchmark_jax(
     dtype,
     max_batches,
     *,
-    prefetch_batches: int = 0,
     multi_gpu: bool = False,
 ):
-    def _maybe_prefetch(source, total_batches: int | None):
-        """Optionally prefetch batches in a background thread."""
-        if prefetch_batches and prefetch_batches > 0:
-            queue: Queue = Queue(maxsize=prefetch_batches)
-            sentinel = object()
-
-            def _producer():
-                for item in source:
-                    queue.put(item)
-                queue.put(sentinel)
-
-            threading.Thread(target=_producer, daemon=True).start()
-
-            def _queue_iter():
-                while True:
-                    item = queue.get()
-                    if item is sentinel:
-                        break
-                    yield item
-
-            return _queue_iter(), total_batches, "prefetch_thread"
-        return source, total_batches, "loader_stream"
 
     wall_start = time.perf_counter()
     jnp_dtype = jnp.dtype(dtype)
@@ -380,15 +355,8 @@ def _benchmark_jax(
             "the configured batch limits."
         )
 
-    if prefetch_batches and prefetch_batches > 0:
-        packed_list = list(loader)
-        total_batches = len(packed_list)
-        graphs_loader, total_batches, load_id = _maybe_prefetch(
-            packed_list, total_batches
-        )
-    else:
-        graphs_loader = loader
-        load_id = "loader_stream"
+    graphs_loader = loader
+    load_id = "loader_stream"
 
     print(f"Running JAX load {load_id}: batches={total_batches}")
 
@@ -566,6 +534,7 @@ def main() -> None:
         seed=None,
         niggli_reduce=False,
         max_batches=args.max_batches,
+        prefetch_batches=args.prefetch_batches,
     )
     print(
         f"Built JAX loader in {time.perf_counter() - prep_start:.2f}s "
@@ -585,7 +554,6 @@ def main() -> None:
         len(atomic_numbers),
         args.dtype,
         args.max_batches,
-        prefetch_batches=args.prefetch_batches,
         multi_gpu=args.multi_gpu,
     )
 
