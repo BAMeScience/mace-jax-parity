@@ -35,10 +35,14 @@ from tqdm import tqdm
 
 from equitrain.backends.jax_utils import load_model_bundle
 from equitrain.data.atomic import AtomicNumberTable
-from equitrain.data.backend_jax import atoms_to_graphs, pack_graphs_greedy
-from equitrain.data.backend_jax.atoms_to_graphs import graph_to_data
+from equitrain.data.backend_jax import pack_graphs_greedy
+from equitrain.data.backend_jax.atoms_to_graphs import (
+    graph_from_configuration,
+    graph_to_data,
+)
 from equitrain.data.backend_torch.loaders_dynamic import DynamicGraphLoader
-from equitrain.data.format_hdf5 import HDF5GraphDataset
+from equitrain.data.configuration import Configuration
+from equitrain.data.format_hdf5 import HDF5Dataset, HDF5GraphDataset
 
 add_safe_globals([slice])
 
@@ -118,6 +122,11 @@ def _parse_args() -> argparse.Namespace:
         default=0,
         help="If >0, spawn a CPU worker to prebuild padded JAX batches and queue them "
         "for the main process. Value sets queue maxsize.",
+    )
+    parser.add_argument(
+        "--multi-gpu",
+        action="store_true",
+        help="Use all available JAX GPUs via pmap (requires batch divisible by device count).",
     )
     return parser.parse_args()
 
@@ -208,22 +217,29 @@ def _prepare_jax_graphs(
     max_batches: int | None,
 ):
     """
-    Load HDF5 structures into jraph.GraphsTuple objects and build a padded loader.
+    Provide a factory that streams HDF5 -> jraph graphs on demand (no full materialization).
     """
-    graphs = []
     target_graphs = None if max_batches is None else max_batches * batch_size
-    dropped_graphs = 0
 
-    for h5_path in h5_files:
-        new_graphs = atoms_to_graphs(h5_path, r_max=r_max, z_table=z_table)
-        graphs.extend(new_graphs)
-        if target_graphs is not None and len(graphs) >= target_graphs:
-            graphs = graphs[:target_graphs]
-            break
-    observed_nodes = max((int(g.n_node.sum()) for g in graphs), default=0)
-    observed_edges = max((int(g.n_edge.sum()) for g in graphs), default=0)
+    def _iter_graphs():
+        emitted = 0
+        for h5_path in h5_files:
+            ds = HDF5Dataset(h5_path, mode="r")
+            try:
+                for idx in range(len(ds)):
+                    atoms = ds[idx]
+                    conf = Configuration.from_atoms(atoms)
+                    graph = graph_from_configuration(
+                        conf, cutoff=r_max, z_table=z_table
+                    )
+                    yield graph
+                    emitted += 1
+                    if target_graphs is not None and emitted >= target_graphs:
+                        return
+            finally:
+                ds.close()
 
-    return graphs, observed_nodes, observed_edges, dropped_graphs
+    return _iter_graphs
 
 
 def _producer_enqueue_batches(batches: list, queue: mp.Queue):
@@ -352,6 +368,7 @@ def _benchmark_jax(
     max_edges_per_batch: int,
     max_nodes_per_batch: int | None,
     prefetch_batches: int = 0,
+    multi_gpu: bool = False,
 ):
     def _maybe_prefetch(source, total_batches: int | None):
         """Optionally prefetch batches in a background process."""
@@ -381,6 +398,18 @@ def _benchmark_jax(
         bundle.module.apply,
         static_argnames=("compute_force", "compute_stress"),
     )
+    # Optional pmap across GPUs.
+    num_devices = jax.local_device_count() if multi_gpu else 1
+    use_pmap = multi_gpu and num_devices > 1
+    pmap_apply = None
+    params_for_apply = bundle.params
+    if use_pmap:
+        pmap_apply = jax.pmap(
+            bundle.module.apply,
+            axis_name="devices",
+            static_argnames=("compute_force", "compute_stress"),
+        )
+        params_for_apply = jax.device_put_replicated(bundle.params, jax.local_devices())
 
     total_graphs = 0
     batches_seen = 0
@@ -390,8 +419,22 @@ def _benchmark_jax(
     if graphs is None:
         return total_graphs, batches_seen, compile_time, wall_start
 
+    def _shard_graph(graph: jraph.GraphsTuple):
+        if not use_pmap:
+            return None
+        graphs_list = list(jraph.unbatch(graph))
+        total = len(graphs_list)
+        if total % num_devices != 0 or total == 0:
+            return None
+        per = total // num_devices
+        shards = []
+        for i in range(num_devices):
+            chunk = graphs_list[i * per : (i + 1) * per]
+            shards.append(jraph.batch_np(chunk))
+        return shards
+
     packed_batches, pack_info = pack_graphs_greedy(
-        graphs,
+        graph_iter_fn=graphs,
         max_edges_per_batch=max_edges_per_batch,
         max_nodes_per_batch=max_nodes_per_batch,
         batch_size_limit=None,
@@ -439,18 +482,40 @@ def _benchmark_jax(
 
     # Warmup compile on first batch (excluded from totals).
     if first_batch is not None:
+        sharded = _shard_graph(first_batch)
+        if use_pmap and sharded is None:
+            tqdm.write(
+                "[JAX] Disabling multi-GPU: batch graphs not divisible by device count."
+            )
+            use_pmap = False
+            params_for_apply = bundle.params
+        if use_pmap and sharded is not None:
+            shard_data = [
+                _graph_to_jax_data(s, num_species=num_species, jnp_dtype=jnp_dtype)
+                for s in sharded
+            ]
+            warm_batch_jax = jax.device_put_sharded(shard_data, jax.local_devices())
+        else:
+            warm_batch_jax = _graph_to_jax_data(
+                first_batch, num_species=num_species, jnp_dtype=jnp_dtype
+            )
         mask = np.asarray(jraph.get_graph_padding_mask(first_batch))
         real_graphs = int(np.sum(mask))
-        warm_batch_jax = _graph_to_jax_data(
-            first_batch, num_species=num_species, jnp_dtype=jnp_dtype
-        )
         warm_start = time.perf_counter()
-        pred = jit_apply(
-            bundle.params,
-            warm_batch_jax,
-            compute_force=False,
-            compute_stress=False,
-        )
+        if use_pmap and pmap_apply is not None:
+            pred = pmap_apply(
+                params_for_apply,
+                warm_batch_jax,
+                compute_force=False,
+                compute_stress=False,
+            )
+        else:
+            pred = jit_apply(
+                params_for_apply,
+                warm_batch_jax,
+                compute_force=False,
+                compute_stress=False,
+            )
         energy = pred["energy"]
         if hasattr(energy, "block_until_ready"):
             energy.block_until_ready()
@@ -487,16 +552,41 @@ def _benchmark_jax(
                 f"[JAX] Padded batch shape graphs={num_graphs} atoms={num_nodes} edges={num_edges} (will trigger XLA compile)"
             )
 
-        batch_jax = _graph_to_jax_data(
-            graph, num_species=num_species, jnp_dtype=jnp_dtype
-        )
+        shard_data = None
+        if use_pmap:
+            shards = _shard_graph(graph)
+            if shards is None:
+                pbar.write(
+                    "[JAX] Disabling multi-GPU mid-run: batch not divisible by device count."
+                )
+                use_pmap = False
+                params_for_apply = bundle.params
+            else:
+                shard_data = [
+                    _graph_to_jax_data(s, num_species=num_species, jnp_dtype=jnp_dtype)
+                    for s in shards
+                ]
+                batch_jax = jax.device_put_sharded(shard_data, jax.local_devices())
 
-        pred = jit_apply(
-            bundle.params,
-            batch_jax,
-            compute_force=False,
-            compute_stress=False,
-        )
+        if not use_pmap:
+            batch_jax = _graph_to_jax_data(
+                graph, num_species=num_species, jnp_dtype=jnp_dtype
+            )
+
+        if use_pmap and pmap_apply is not None and shard_data is not None:
+            pred = pmap_apply(
+                params_for_apply,
+                batch_jax,
+                compute_force=False,
+                compute_stress=False,
+            )
+        else:
+            pred = jit_apply(
+                params_for_apply,
+                batch_jax,
+                compute_force=False,
+                compute_stress=False,
+            )
         energy = pred["energy"]
         if hasattr(energy, "block_until_ready"):
             energy.block_until_ready()
@@ -547,27 +637,16 @@ def main() -> None:
     h5_files = _list_h5_files()
 
     prep_start = time.perf_counter()
-    (
-        jax_graphs_list,
-        observed_nodes,
-        observed_edges,
-        dropped_graphs,
-    ) = _prepare_jax_graphs(
+    graph_iter_fn = _prepare_jax_graphs(
         h5_files,
         z_table,
         r_max,
         args.batch_size,
         args.max_batches,
     )
-    if dropped_graphs:
-        print(
-            f"WARNING: Dropped {dropped_graphs} graphs exceeding "
-            f"max_nodes={args.max_nodes} or max_edges={args.max_edges}."
-        )
     print(
         f"Built JAX graphs/loader in {time.perf_counter() - prep_start:.2f}s "
-        f"({len(jax_graphs_list)} graphs loaded, "
-        f"observed_max_nodes={observed_nodes}, observed_max_edges={observed_edges})"
+        "(streaming iterator from HDF5)"
     )
 
     (
@@ -579,13 +658,14 @@ def main() -> None:
         jax,
         jnp,
         bundle,
-        jax_graphs_list,
+        graph_iter_fn,
         len(atomic_numbers),
         args.dtype,
         args.max_batches,
         prefetch_batches=args.prefetch_batches,
         max_edges_per_batch=args.max_edges_per_batch,
         max_nodes_per_batch=args.max_nodes_per_batch,
+        multi_gpu=args.multi_gpu,
     )
 
     (
