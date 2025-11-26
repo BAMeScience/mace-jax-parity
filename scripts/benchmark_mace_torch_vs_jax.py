@@ -35,7 +35,7 @@ from tqdm import tqdm
 
 from equitrain.backends.jax_utils import load_model_bundle
 from equitrain.data.atomic import AtomicNumberTable
-from equitrain.data.backend_jax import atoms_to_graphs
+from equitrain.data.backend_jax import atoms_to_graphs, pack_graphs_greedy
 from equitrain.data.backend_jax.atoms_to_graphs import graph_to_data
 from equitrain.data.backend_torch.loaders_dynamic import DynamicGraphLoader
 from equitrain.data.format_hdf5 import HDF5GraphDataset
@@ -226,107 +226,6 @@ def _prepare_jax_graphs(
     return graphs, observed_nodes, observed_edges, dropped_graphs
 
 
-def _pack_by_edges(
-    graphs: list,
-    *,
-    max_edges_per_batch: int,
-    max_nodes_per_batch: int | None,
-    batch_size_limit: int | None,
-):
-    """
-    Greedy pack graphs into batches limited by edge/node counts. Drops oversized graphs.
-    Returns a generator over padded batches plus (dropped, total_batches).
-    """
-
-    def _scan_for_caps():
-        current_len = edge_sum = node_sum = 0
-        max_graphs = max_total_nodes = max_total_edges = 0
-        dropped = batches = 0
-        for g in graphs:
-            g_edges = int(g.n_edge.sum())
-            g_nodes = int(g.n_node.sum())
-            if g_edges > max_edges_per_batch or (
-                max_nodes_per_batch is not None and g_nodes > max_nodes_per_batch
-            ):
-                dropped += 1
-                continue
-            would_edges = edge_sum + g_edges
-            would_nodes = node_sum + g_nodes
-            if current_len and (
-                would_edges > max_edges_per_batch
-                or (
-                    max_nodes_per_batch is not None
-                    and would_nodes > max_nodes_per_batch
-                )
-                or (batch_size_limit is not None and current_len >= batch_size_limit)
-            ):
-                max_graphs = max(max_graphs, current_len)
-                max_total_nodes = max(max_total_nodes, node_sum)
-                max_total_edges = max(max_total_edges, edge_sum)
-                batches += 1
-                current_len = edge_sum = node_sum = 0
-            current_len += 1
-            edge_sum += g_edges
-            node_sum += g_nodes
-        if current_len:
-            max_graphs = max(max_graphs, current_len)
-            max_total_nodes = max(max_total_nodes, node_sum)
-            max_total_edges = max(max_total_edges, edge_sum)
-            batches += 1
-        return (
-            max_graphs + 1 if max_graphs else 1,
-            max_total_nodes + 1 if max_total_nodes else 1,
-            max_total_edges + 1 if max_total_edges else 1,
-            dropped,
-            batches,
-        )
-
-    pad_graphs, pad_nodes, pad_edges, dropped, total_batches = _scan_for_caps()
-
-    def _iter_padded():
-        current: list = []
-        edge_sum = node_sum = 0
-        for g in graphs:
-            g_edges = int(g.n_edge.sum())
-            g_nodes = int(g.n_node.sum())
-            if g_edges > max_edges_per_batch or (
-                max_nodes_per_batch is not None and g_nodes > max_nodes_per_batch
-            ):
-                continue
-            would_edges = edge_sum + g_edges
-            would_nodes = node_sum + g_nodes
-            if current and (
-                would_edges > max_edges_per_batch
-                or (
-                    max_nodes_per_batch is not None
-                    and would_nodes > max_nodes_per_batch
-                )
-                or (batch_size_limit is not None and len(current) >= batch_size_limit)
-            ):
-                batched = jraph.batch_np(current)
-                yield jraph.pad_with_graphs(
-                    batched,
-                    n_node=pad_nodes,
-                    n_edge=pad_edges,
-                    n_graph=pad_graphs,
-                )
-                current = []
-                edge_sum = node_sum = 0
-            current.append(g)
-            edge_sum += g_edges
-            node_sum += g_nodes
-        if current:
-            batched = jraph.batch_np(current)
-            yield jraph.pad_with_graphs(
-                batched,
-                n_node=pad_nodes,
-                n_edge=pad_edges,
-                n_graph=pad_graphs,
-            )
-
-    return _iter_padded(), dropped, total_batches
-
-
 def _producer_enqueue_batches(batches: list, queue: mp.Queue):
     """CPU worker to enqueue prebuilt batches."""
     try:
@@ -491,12 +390,14 @@ def _benchmark_jax(
     if graphs is None:
         return total_graphs, batches_seen, compile_time, wall_start
 
-    packed_batches, dropped_graphs, total_batches = _pack_by_edges(
+    packed_batches, pack_info = pack_graphs_greedy(
         graphs,
         max_edges_per_batch=max_edges_per_batch,
         max_nodes_per_batch=max_nodes_per_batch,
         batch_size_limit=None,
     )
+    dropped_graphs = pack_info.get("dropped", 0)
+    total_batches = pack_info.get("total_batches", None)
     print(
         f"Greedy edge-packed batches: {total_batches} batches, "
         f"max_edges_per_batch={max_edges_per_batch}, "
