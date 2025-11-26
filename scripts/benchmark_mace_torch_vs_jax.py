@@ -39,9 +39,9 @@ from equitrain.backends.jax_utils import (
     replicate_to_local_devices,
 )
 from equitrain.data.atomic import AtomicNumberTable
-from equitrain.data.backend_jax import get_dataloader
+from equitrain.data.backend_jax import get_dataloader as get_dataloader_jax
 from equitrain.data.backend_jax.atoms_to_graphs import graph_to_data
-from equitrain.data.backend_torch import loaders as torch_loaders
+from equitrain.data.backend_torch import get_dataloader as get_dataloader_torch
 
 add_safe_globals([slice])
 
@@ -257,7 +257,7 @@ def _benchmark_torch(
             niggli_reduce=False,
         )
         for h5_path in h5_files:
-            loader = torch_loaders.get_dataloader(
+            loader = get_dataloader_torch(
                 base_args,
                 h5_path,
                 atomic_numbers=z_table,
@@ -298,8 +298,6 @@ def _benchmark_torch(
 
 
 def _benchmark_jax(
-    jax,
-    jnp,
     bundle,
     loader,
     num_species,
@@ -308,7 +306,6 @@ def _benchmark_jax(
     *,
     multi_gpu: bool = False,
 ):
-
     wall_start = time.perf_counter()
     jnp_dtype = jnp.dtype(dtype)
     jit_apply = jax.jit(
@@ -523,7 +520,7 @@ def main() -> None:
     h5_files = _list_h5_files()
 
     prep_start = time.perf_counter()
-    jax_loader = get_dataloader(
+    jax_loader = get_dataloader_jax(
         data_file=h5_files,
         atomic_numbers=z_table,
         r_max=r_max,
@@ -547,8 +544,6 @@ def main() -> None:
         jax_compile,
         jax_wall_time,
     ) = _benchmark_jax(
-        jax,
-        jnp,
         bundle,
         jax_loader,
         len(atomic_numbers),
