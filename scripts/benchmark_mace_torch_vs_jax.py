@@ -123,7 +123,7 @@ def _parse_args() -> argparse.Namespace:
         "for the main process. Value sets queue maxsize.",
     )
     parser.add_argument(
-        "--workers",
+        "--num-workers",
         type=int,
         default=4,
         help="Number of background threads to construct JAX graphs.",
@@ -279,7 +279,7 @@ def _benchmark_torch(
     with torch.no_grad():
         base_args = SimpleNamespace(
             pin_memory=False,
-            workers=0,
+            num_workers=0,
             batch_size=batch_size,
             shuffle=False,
             batch_max_nodes=None,
@@ -565,7 +565,7 @@ def main() -> None:
         niggli_reduce=False,
         max_batches=args.max_batches,
         prefetch_batches=args.prefetch_batches,
-        num_workers=args.workers,
+        num_workers=args.num_workers,
         graph_multiple=device_multiplier,
     )
     print(
