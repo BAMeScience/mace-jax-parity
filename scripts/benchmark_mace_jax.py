@@ -1,18 +1,9 @@
 #!/usr/bin/env python3
 """
-Benchmark the inference throughput of a Torch MACE model and its JAX
-counterpart on the mp-traj HDF5 datasets. The script runs both models over the
-same batches, records timings, and reports graphs/sec together with the JAX
-compile overhead. The dtype is enforced to be identical for both models, and
-you can point the Torch and JAX runs at GPU devices for fair comparisons.
-
-Example
--------
-    python scripts/benchmark_mace_torch_vs_jax.py \\
-        --torch-model models/mace_foundation.pt \\
-        --jax-model models/mace_jax_bundle \\
-        --device gpu \\
-        --dtype float32
+Benchmark the inference throughput of a JAX MACE model on the mp-traj HDF5
+datasets. The script streams fixed-shape batches, records timings, and reports
+graphs/sec together with the XLA compile overhead. Torch is only used to load
+the reference model so we can extract shared metadata such as atomic numbers.
 """
 
 from __future__ import annotations
@@ -21,16 +12,13 @@ import argparse
 import itertools
 import time
 from pathlib import Path
-from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
-from jax import tree_util as jtu
 import jraph
 import numpy as np
 import torch
-
-# Torch 2.6 tightened torch.load defaults; the checkpoints still store ``slice``.
+from jax import tree_util as jtu
 from torch.serialization import add_safe_globals
 from tqdm import tqdm
 
@@ -41,16 +29,13 @@ from equitrain.backends.jax_utils import (
 from equitrain.data.atomic import AtomicNumberTable
 from equitrain.data.backend_jax import get_dataloader as get_dataloader_jax
 from equitrain.data.backend_jax.atoms_to_graphs import graph_to_data
-from equitrain.data.backend_torch import get_dataloader as get_dataloader_torch
 
 add_safe_globals([slice])
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=(
-            "Run Torch and JAX MACE models over mp-traj batches and report throughput."
-        )
+        description="Benchmark a JAX MACE bundle on mp-traj data."
     )
     parser.add_argument(
         "--torch-model",
@@ -77,23 +62,17 @@ def _parse_args() -> argparse.Namespace:
         help='Which split to benchmark (default: valid). Use "all" to process every *.h5 file.',
     )
     parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=18,
-        help="Batch size for the PyG DataLoader (default: 8).",
-    )
-    parser.add_argument(
         "--dtype",
         type=str,
         default="float32",
-        help="Floating point precision to enforce for both models (default: float32).",
+        help="Floating point precision to enforce (default: float32).",
     )
     parser.add_argument(
         "--device",
         type=str,
         default="cpu",
         help=(
-            "Device for both Torch and JAX (cpu/gpu/cuda/cuda:0). "
+            "Device for the Torch metadata load (cpu/gpu/cuda/cuda:0). "
             "Values starting with 'gpu' are treated as CUDA."
         ),
     )
@@ -119,8 +98,7 @@ def _parse_args() -> argparse.Namespace:
         "--prefetch-batches",
         type=int,
         default=0,
-        help="If >0, spawn a CPU worker to prebuild padded JAX batches and queue them "
-        "for the main process. Value sets queue maxsize.",
+        help="If >0, build padded JAX batches ahead of time (queue size = value).",
     )
     parser.add_argument(
         "--num-workers",
@@ -131,35 +109,25 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--multi-gpu",
         action="store_true",
-        help="Use all available JAX GPUs via pmap (requires batch divisible by device count).",
+        help="Use all available GPUs via pmap (requires batch divisible by device count).",
     )
     return parser.parse_args()
 
 
-def _resolve_devices(spec: str) -> tuple[torch.device, str]:
-    """Interpret the CLI device flag for Torch and infer the JAX platform."""
+def _resolve_devices(spec: str) -> torch.device:
     text = spec.strip()
     lower = text.lower()
     if lower.startswith("gpu"):
         torch_spec = "cuda" + text[3:]
     else:
         torch_spec = text
-    device = torch.device(torch_spec)
-    platform = "gpu" if device.type == "cuda" else "cpu"
-    return device, platform
+    return torch.device(torch_spec)
 
 
 def _extract_atomic_numbers(torch_model, jax_bundle):
-    """
-    Resolve the list of atomic numbers to build the AtomicNumberTable used for
-    graph construction and shared by both Torch and JAX runs. We try the Torch
-    checkpoint first (it may store an AtomicNumberTable, tensor, or plain list),
-    then fall back to the JAX bundle config. Failing both, we error because the
-    models would be misconfigured.
-    """
     if hasattr(torch_model, "atomic_numbers"):
         numbers = getattr(torch_model, "atomic_numbers")
-        if hasattr(numbers, "zs"):  # AtomicNumberTable
+        if hasattr(numbers, "zs"):
             return [int(z) for z in numbers.zs]
         if isinstance(numbers, torch.Tensor):
             return [int(z) for z in numbers.detach().cpu().tolist()]
@@ -194,8 +162,7 @@ def _graph_to_jax_data(graph, num_species: int, jnp_dtype):
             casted[k] = v.astype(jnp_dtype)
         else:
             casted[k] = v
-    data = jax.device_put(casted)
-    return data
+    return jax.device_put(casted)
 
 
 def _count_real_graphs(graph: jraph.GraphsTuple) -> int:
@@ -208,7 +175,6 @@ def _prepare_multi_device_batch(
     num_species: int,
     jnp_dtype,
 ):
-    """Convert per-device graphs to data dicts and stack them along device axis."""
     device_batches = [
         _graph_to_jax_data(graph, num_species=num_species, jnp_dtype=jnp_dtype)
         for graph in graphs
@@ -223,109 +189,13 @@ def _prepare_multi_device_batch(
     return jtu.tree_map(_stack_or_none, *device_batches)
 
 
-def _forward_torch(model, batch):
-    return model(batch, compute_force=False, compute_stress=False)
-
-
-def _setup_jax(platform: str, enable_x64: bool):
-    jax.config.update("jax_platform_name", platform)
-    jax.config.update("jax_enable_x64", enable_x64)
-    # Favor speed (allow TF32/fast matmul on GPU).
+def _setup_jax(enable_x64: bool):
+    if enable_x64:
+        jax.config.update("jax_enable_x64", True)
     try:
         jax.config.update("jax_default_matmul_precision", "fastest")
     except Exception:
         pass
-    return None
-
-
-def _load_jax_bundle(bundle_path: Path, dtype: str, platform: str):
-    cache_dir = Path(bundle_path) / ".cache"
-    Path(cache_dir).mkdir(parents=True, exist_ok=True)
-    jax.config.update("jax_compilation_cache_dir", str(cache_dir))
-    jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
-    jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
-    jax.config.update(
-        "jax_persistent_cache_enable_xla_caches",
-        "xla_gpu_per_fusion_autotune_cache_dir",
-    )
-    print(f"JAX compilation cache configured at {cache_dir}")
-
-    _setup_jax(platform, enable_x64=dtype == "float64")
-
-    bundle = load_model_bundle(str(bundle_path), dtype=dtype)
-    return bundle
-
-
-def _benchmark_torch(
-    model,
-    h5_files,
-    z_table,
-    r_max,
-    batch_size,
-    dtype,
-    device,
-    max_batches,
-):
-    wall_start = time.perf_counter()
-    total_graphs = 0
-    batches_seen = 0
-
-    sync = (
-        torch.cuda.synchronize
-        if device.type == "cuda" and torch.cuda.is_available()
-        else None
-    )
-
-    with torch.no_grad():
-        base_args = SimpleNamespace(
-            pin_memory=False,
-            num_workers=0,
-            batch_size=batch_size,
-            shuffle=False,
-            batch_max_nodes=None,
-            batch_max_edges=None,
-            batch_drop=False,
-            niggli_reduce=False,
-        )
-        for h5_path in h5_files:
-            loader = get_dataloader_torch(
-                base_args,
-                h5_path,
-                atomic_numbers=z_table,
-                r_max=r_max,
-                accelerator=None,
-            )
-            if loader is None:
-                raise RuntimeError(f"Failed to build Torch loader for {h5_path}")
-
-            pbar = tqdm(total=len(loader), desc=f"Torch {h5_path.name}", leave=True)
-
-            for item in loader:
-                batches = item if isinstance(item, list) else [item]
-                if len(batches) > 1:
-                    pbar.total += len(batches) - 1
-                    pbar.refresh()
-                for batch in batches:
-                    if max_batches is not None and batches_seen >= max_batches:
-                        pbar.close()
-                        return total_graphs, batches_seen, wall_start
-
-                    batch = batch.to(device=device)
-
-                    if sync:
-                        sync()
-                    pred = _forward_torch(model, batch)
-                    energy = pred["energy"].detach()
-                    if sync:
-                        sync()
-
-                    total_graphs += energy.shape[0]
-                    batches_seen += 1
-                    pbar.update(1)
-            pbar.close()
-
-    wall_time = time.perf_counter() - wall_start
-    return total_graphs, batches_seen, wall_time
 
 
 def _benchmark_jax(
@@ -335,7 +205,7 @@ def _benchmark_jax(
     dtype,
     max_batches,
     *,
-    multi_gpu: bool = False,
+    multi_gpu: bool,
 ):
     wall_start = time.perf_counter()
     jnp_dtype = jnp.dtype(dtype)
@@ -349,7 +219,6 @@ def _benchmark_jax(
         )
 
     jit_apply = jax.jit(_apply_fn)
-    # Optional pmap across GPUs.
     num_devices = jax.local_device_count() if multi_gpu else 1
     use_pmap = multi_gpu and num_devices > 1
     pmap_apply = None
@@ -370,33 +239,22 @@ def _benchmark_jax(
         total_batches = len(loader)
     except TypeError:
         total_batches = None
-    progress_total = None
-    if total_batches is not None:
-        progress_total = (
-            total_batches // num_devices if use_pmap and num_devices > 0 else total_batches
-        )
+    progress_total = (
+        total_batches // num_devices if total_batches and use_pmap else total_batches
+    )
     pack_info = getattr(loader, "pack_info", lambda: {})()
     dropped_graphs = pack_info.get("dropped", 0)
-    pad_graphs = pack_info.get("pad_graphs", "?")
-    pad_nodes = pack_info.get("pad_nodes", "?")
-    pad_edges = pack_info.get("pad_edges", "?")
     print(
-        f"JAX loader: batches={total_batches}, pad_graphs={pad_graphs}, "
-        f"pad_nodes={pad_nodes}, pad_edges={pad_edges}"
+        f"JAX loader: batches={total_batches}, pad_graphs={pack_info.get('pad_graphs', '?')}, "
+        f"pad_nodes={pack_info.get('pad_nodes', '?')}, pad_edges={pack_info.get('pad_edges', '?')}"
     )
     if dropped_graphs:
         print(
-            f"WARNING: Dropped {dropped_graphs} graphs exceeding "
-            "the configured batch limits."
+            f"WARNING: dropped {dropped_graphs} graphs exceeding the configured limits."
         )
 
-    graphs_loader = loader
-    load_id = "loader_stream"
-
-    print(f"Running JAX load {load_id}: batches={total_batches}")
-
     def _iter_micro_batches():
-        for item in graphs_loader:
+        for item in loader:
             if isinstance(item, list):
                 for sub in item:
                     if sub is not None:
@@ -455,13 +313,12 @@ def _benchmark_jax(
             graphs_chunk[0], num_species=num_species, jnp_dtype=jnp_dtype
         )
 
-    # Warmup compile on first chunk (excluded from totals).
     warm_start = time.perf_counter()
-    warm_batch_jax = _prepare_chunk(first_chunk)
+    warm_batch = _prepare_chunk(first_chunk)
     if use_pmap and pmap_apply is not None:
-        pred = pmap_apply(params_for_apply, warm_batch_jax)
+        pred = pmap_apply(params_for_apply, warm_batch)
     else:
-        pred = jit_apply(params_for_apply, warm_batch_jax)
+        pred = jit_apply(params_for_apply, warm_batch)
     energy = pred["energy"]
     if hasattr(energy, "block_until_ready"):
         energy.block_until_ready()
@@ -483,20 +340,21 @@ def _benchmark_jax(
         graphs = chunk if isinstance(chunk, list) else [chunk]
         real_graphs = sum(_count_real_graphs(graph) for graph in graphs)
         rep_graph = graphs[0]
-        num_graphs = int(rep_graph.n_node.shape[0])
-        num_nodes = int(rep_graph.nodes.positions.shape[0])
-        num_edges = int(rep_graph.edges.shifts.shape[0])
-        signature = (num_graphs, num_nodes, num_edges, len(graphs))
+        signature = (
+            int(rep_graph.n_node.shape[0]),
+            int(rep_graph.nodes.positions.shape[0]),
+            int(rep_graph.edges.shifts.shape[0]),
+            len(graphs),
+        )
         shape_hits[signature] = shape_hits.get(signature, 0) + 1
         if shape_hits[signature] == 1 and len(shape_hits) <= 5:
             pbar.write(
                 "[JAX] Padded batch shape "
-                f"graphs/device={num_graphs} atoms={num_nodes} edges={num_edges} "
-                f"devices={len(graphs)} (will trigger XLA compile)"
+                f"graphs/device={signature[0]} atoms={signature[1]} edges={signature[2]} "
+                f"devices={signature[3]} (will trigger XLA compile)"
             )
 
         batch_jax = _prepare_chunk(graphs)
-
         if use_pmap and pmap_apply is not None:
             pred = pmap_apply(params_for_apply, batch_jax)
         else:
@@ -512,6 +370,25 @@ def _benchmark_jax(
     return total_graphs, batches_seen, compile_time, wall_time
 
 
+def _load_torch_model(args, device: torch.device, torch_dtype):
+    model = torch.load(
+        args.torch_model,
+        map_location=device,
+        weights_only=False,
+    )
+    model = model.to(device=device, dtype=torch_dtype).eval()
+    return model
+
+
+def _list_h5_files(args) -> list[Path]:
+    files = sorted(args.data_dir.glob("*.h5"))
+    if args.split != "all":
+        files = [p for p in files if p.stem == args.split]
+    if not files:
+        raise FileNotFoundError(f"No HDF5 files found under {args.data_dir}")
+    return files
+
+
 def main() -> None:
     args = _parse_args()
 
@@ -519,40 +396,19 @@ def main() -> None:
     if torch_dtype is None:
         raise ValueError(f"Unsupported dtype: {args.dtype}")
 
-    device, jax_platform = _resolve_devices(args.device)
+    torch_device = _resolve_devices(args.device)
 
-    def _load_torch_model() -> torch.nn.Module:
-        model = torch.load(
-            args.torch_model,
-            map_location=device,
-            weights_only=False,
-        )
-        model = model.to(device=device, dtype=torch_dtype).eval()
-        if hasattr(model, "atomic_energies_fn"):
-            energies = getattr(model.atomic_energies_fn, "atomic_energies", None)
-            if isinstance(energies, torch.Tensor):
-                model.atomic_energies_fn.atomic_energies = energies.to(torch_dtype)
-        return model
-
-    def _list_h5_files() -> list[Path]:
-        files = sorted(args.data_dir.glob("*.h5"))
-        if args.split != "all":
-            files = [p for p in files if p.stem == args.split]
-        if not files:
-            raise FileNotFoundError(f"No HDF5 files found under {args.data_dir}")
-        return files
-
-    torch_model = _load_torch_model()
-    bundle = _load_jax_bundle(args.jax_model, dtype=args.dtype, platform=jax_platform)
+    torch_model = _load_torch_model(args, torch_device, torch_dtype)
+    bundle = load_model_bundle(str(args.jax_model), dtype=args.dtype)
+    _setup_jax(enable_x64=args.dtype == "float64")
 
     atomic_numbers = _extract_atomic_numbers(torch_model, bundle)
     r_max = _extract_r_max(torch_model, bundle)
     z_table = AtomicNumberTable(atomic_numbers)
-    h5_files = _list_h5_files()
+    h5_files = _list_h5_files(args)
 
     prep_start = time.perf_counter()
     device_multiplier = jax.local_device_count() if args.multi_gpu else 1
-
     jax_loader = get_dataloader_jax(
         data_file=h5_files,
         atomic_numbers=z_table,
@@ -587,34 +443,11 @@ def main() -> None:
         multi_gpu=args.multi_gpu,
     )
 
-    (
-        torch_graphs,
-        torch_batches,
-        torch_wall_time,
-    ) = _benchmark_torch(
-        torch_model,
-        h5_files,
-        z_table,
-        r_max,
-        args.batch_size,
-        torch_dtype,
-        device,
-        args.max_batches,
-    )
-
     def _throughput(graphs, elapsed):
         return graphs / elapsed if elapsed and graphs else 0.0
 
     print(
-        f"Torch [{args.dtype}] on {device}: "
-        f"{torch_graphs} graphs across {torch_batches} batches "
-        f"in {torch_wall_time:.3f}s (wall, includes all prep/compute) => "
-        f"{_throughput(torch_graphs, torch_wall_time):.2f} graphs/s"
-    )
-
-    print(
-        f"JAX [{args.dtype}] on {jax_platform}: "
-        f"{jax_graphs} graphs across {jax_batches} batches "
+        f"JAX [{args.dtype}]: {jax_graphs} graphs across {jax_batches} batches "
         f"in {jax_wall_time:.3f}s (wall, includes compile) => "
         f"{_throughput(jax_graphs, jax_wall_time):.2f} graphs/s"
     )
