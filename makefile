@@ -17,7 +17,7 @@ benchmark-torch: models/mace_foundation.pt
 	accelerate launch scripts/benchmark_mace_torch.py --torch-model models/mace_foundation.pt --data-dir data/mptraj --split valid --batch-size 18 --dtype float32 --device cuda --num-workers 8
 
 benchmark-jax: models/mace_jax_bundle
-	python scripts/benchmark_mace_jax.py --torch-model models/mace_foundation.pt --jax-model models/mace_jax_bundle --data-dir data/mptraj --split valid --dtype float32 --device cuda --max-edges-per-batch 240000 --max-nodes-per-batch 200000 --prefetch-batches 64 --num-workers 8 --multi-gpu
+	python scripts/benchmark_mace_jax.py --torch-model models/mace_foundation.pt --jax-model models/mace_jax_bundle --data-dir data/mptraj --split valid --dtype float32 --device cuda --max-edges-per-batch 480000 --max-nodes-per-batch 200000 --prefetch-batches 64 --num-workers 8 --multi-gpu
 
 ################################################################################
 

@@ -409,6 +409,10 @@ def main() -> None:
 
     prep_start = time.perf_counter()
     device_multiplier = jax.local_device_count() if args.multi_gpu else 1
+    effective_workers = max(int(args.num_workers or 0), 0)
+    if args.multi_gpu:
+        effective_workers *= max(jax.local_device_count(), 1)
+
     jax_loader = get_dataloader_jax(
         data_file=h5_files,
         atomic_numbers=z_table,
@@ -421,7 +425,7 @@ def main() -> None:
         niggli_reduce=False,
         max_batches=args.max_batches,
         prefetch_batches=args.prefetch_batches,
-        num_workers=args.num_workers,
+        num_workers=effective_workers,
         graph_multiple=device_multiplier,
     )
     print(
