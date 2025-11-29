@@ -12,12 +12,9 @@ import argparse
 import csv
 from pathlib import Path
 
-import jax
 import numpy as np
 import torch
-from torch_geometric.data import Batch
-from torch_geometric.loader import DataLoader as PyGDataLoader
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
 try:  # pragma: no cover - torch<2.6 compatibility
     from torch.serialization import add_safe_globals
@@ -34,10 +31,12 @@ if callable(add_safe_globals):  # pragma: no cover - guard for torch<2.6
         safe_globals.append(ScaleShiftMACE)
     add_safe_globals(safe_globals)
 
-from equitrain.backends.jax_utils import load_model_bundle
-from equitrain.backends.jax_wrappers import MaceWrapper as JaxMaceWrapper
-from equitrain.data.atomic import AtomicNumberTable
-from equitrain.data.format_hdf5 import HDF5GraphDataset
+from equitrain import get_args_parser_predict
+from equitrain.backends.jax_predict import predict as jax_predict
+from equitrain.backends.torch_model import get_model as get_torch_model
+from equitrain.backends.torch_predict import _predict as torch_predict_impl
+from equitrain.backends.torch_utils import set_dtype as torch_set_dtype
+from equitrain.data.backend_torch.loaders import get_dataloader as get_torch_loader
 
 
 def _parse_args() -> argparse.Namespace:
@@ -72,7 +71,7 @@ def _parse_args() -> argparse.Namespace:
         "--batch-size",
         type=int,
         default=4,
-        help="Batch size for the PyG DataLoader (default: 4).",
+        help="Batch size fed into the equitrain predict routines (default: 4).",
     )
     parser.add_argument(
         "--energy-tol",
@@ -98,148 +97,112 @@ def _parse_args() -> argparse.Namespace:
         default=Path("energy_diffs.csv"),
         help="Write per-graph energy differences to the given CSV path (default: energy_diffs.csv).",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print per-graph warnings when discrepancies exceed the tolerance.",
+    )
     return parser.parse_args()
 
 
-def _get_batch_value(batch: Batch, key: str):
-    try:
-        return batch[key]
-    except (AttributeError, KeyError, TypeError):
-        return getattr(batch, key)
+def _make_predict_args(base_args, backend: str, model_path: Path, predict_file: Path):
+    predict_args = get_args_parser_predict().parse_args([])
+    predict_args.backend = backend
+    predict_args.model = str(model_path)
+    predict_args.predict_file = str(predict_file)
+    predict_args.batch_size = base_args.batch_size
+    predict_args.dtype = base_args.dtype
+    predict_args.energy_weight = 1.0
+    predict_args.forces_weight = 0.0
+    predict_args.stress_weight = 0.0
+    if backend == "torch":
+        predict_args.shuffle = False
+    predict_args.model_wrapper = getattr(base_args, "model_wrapper", None) or "mace"
+    if not hasattr(predict_args, "pin_memory"):
+        predict_args.pin_memory = False
+    if not hasattr(predict_args, "num_workers"):
+        predict_args.num_workers = 0
+    if not hasattr(predict_args, "batch_max_nodes"):
+        predict_args.batch_max_nodes = None
+    if not hasattr(predict_args, "batch_max_edges"):
+        predict_args.batch_max_edges = None
+    if not hasattr(predict_args, "batch_drop"):
+        predict_args.batch_drop = False
+    if not hasattr(predict_args, "niggli_reduce"):
+        predict_args.niggli_reduce = False
+    return predict_args
 
 
-def _set_batch_value(batch: Batch, key: str, value):
-    try:
-        batch[key] = value
-    except (AttributeError, KeyError, TypeError):
-        setattr(batch, key, value)
-
-
-def _batch_to_jax(batch: Batch):
-    data_dict = {}
-    for key in batch.keys():
-        value = _get_batch_value(batch, key)
-        if isinstance(value, torch.Tensor):
-            data_dict[key] = jax.device_put(value.detach().cpu().numpy())
-        else:
-            data_dict[key] = value
-    return data_dict
-
-
-def _cast_batch(batch, dtype):
-    for key in batch.keys():
-        value = _get_batch_value(batch, key)
-        if isinstance(value, torch.Tensor) and value.dtype.is_floating_point:
-            _set_batch_value(batch, key, value.to(dtype))
-    return batch
-
-
-def _extract_atomic_numbers(torch_model, jax_bundle):
-    if hasattr(torch_model, "atomic_numbers"):
-        numbers = getattr(torch_model, "atomic_numbers")
-        if hasattr(numbers, "zs"):  # AtomicNumberTable
-            return [int(z) for z in numbers.zs]
-        if isinstance(numbers, torch.Tensor):
-            return [int(z) for z in numbers.detach().cpu().tolist()]
-        if isinstance(numbers, (list, tuple)):
-            return [int(z) for z in numbers]
-    config_numbers = jax_bundle.config.get("atomic_numbers")
-    if config_numbers is not None:
-        return [int(z) for z in config_numbers]
-    raise RuntimeError("Unable to infer atomic numbers from the provided models.")
-
-
-def _extract_r_max(torch_model, jax_bundle):
-    value = getattr(torch_model, "r_max", None)
-    if value is not None:
-        if isinstance(value, torch.Tensor):
-            return float(value.detach().cpu().item())
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            pass
-    config_value = jax_bundle.config.get("r_max")
-    if config_value is not None:
-        return float(config_value)
-    raise RuntimeError("Unable to infer r_max from the provided models.")
-
-
-def _extract_energy(pred):
-    if isinstance(pred, dict):
-        if "energy" not in pred:
-            raise RuntimeError("Torch model output dict lacks `energy` key.")
-        return pred["energy"]
-    if isinstance(pred, (list, tuple)):
-        return pred[0]
-    return pred
-
-
-def _graph_indices(batch, size):
-    if hasattr(batch, "idx"):
-        idx = getattr(batch, "idx")
-        if isinstance(idx, torch.Tensor):
-            return [int(i) for i in idx.detach().cpu().tolist()]
-    return list(range(size))
-
-
-def _build_loader(
-    h5_path: Path, z_table: AtomicNumberTable, r_max: float, batch_size: int
-):
-    dataset = HDF5GraphDataset(
-        h5_path,
-        r_max=r_max,
-        atomic_numbers=z_table,
+def _predict_torch(args, predict_file: Path):
+    predict_args = _make_predict_args(
+        args, backend="torch", model_path=args.torch_model, predict_file=predict_file
     )
-    return PyGDataLoader(dataset, batch_size=batch_size, shuffle=False, drop_last=False)
+    device = torch.device(args.device)
+    if device.type == "cpu":
+        energy, _, _ = torch_predict_impl(predict_args, device=device)
+        return energy.detach().cpu().numpy()
+    return _predict_torch_gpu(predict_args, predict_file, device)
 
 
-def _forward_torch(model, batch):
-    try:
-        return model(batch, compute_force=False, compute_stress=False)
-    except TypeError:
-        return model(batch)
+def _predict_jax(args, predict_file: Path):
+    predict_args = _make_predict_args(
+        args, backend="jax", model_path=args.jax_model, predict_file=predict_file
+    )
+    energy, _, _ = jax_predict(predict_args)
+    return np.asarray(energy)
+
+
+def _predict_torch_gpu(predict_args, predict_file: Path, device: torch.device):
+    torch_set_dtype(predict_args.dtype)
+    model = get_torch_model(predict_args)
+    model = model.to(device=device, dtype=getattr(torch, predict_args.dtype))
+    model.eval()
+
+    atomic_numbers = getattr(model.atomic_numbers, "zs", model.atomic_numbers)
+    if isinstance(atomic_numbers, torch.Tensor):
+        atomic_numbers = atomic_numbers.detach().cpu().tolist()
+    elif hasattr(atomic_numbers, "zs"):
+        atomic_numbers = list(atomic_numbers.zs)
+
+    r_max = model.r_max
+    if isinstance(r_max, torch.Tensor):
+        r_max = float(r_max.detach().cpu().item())
+    else:
+        r_max = float(r_max)
+
+    loader = get_torch_loader(
+        predict_args,
+        predict_file,
+        atomic_numbers,
+        r_max,
+        accelerator=None,
+    )
+    if loader is None:
+        return np.zeros((0,), dtype=np.float32)
+
+    energies = []
+    with torch.no_grad():
+        for data_list in loader:
+            for data in data_list:
+                if hasattr(data, "to"):
+                    data = data.to(device)
+                y_pred = model(data)
+                energy = y_pred["energy"]
+                if not isinstance(energy, torch.Tensor):
+                    energy = torch.as_tensor(energy)
+                energies.append(energy.detach().cpu())
+
+    if not energies:
+        return np.zeros((0,), dtype=np.float32)
+    stacked = torch.cat(energies, dim=0)
+    return stacked.numpy()
 
 
 def main() -> None:
     args = _parse_args()
 
-    torch_dtype = getattr(torch, args.dtype, None)
-    if torch_dtype is None:
+    if getattr(torch, args.dtype, None) is None:
         raise ValueError(f"Unsupported Torch dtype: {args.dtype}")
-    device = torch.device(args.device)
-
-    torch_model = torch.load(
-        args.torch_model,
-        map_location=device,
-        weights_only=False,
-    )
-    torch_model = torch_model.to(device=device)
-    torch_model = torch_model.to(dtype=torch_dtype)
-    if hasattr(torch_model, "atomic_energies_fn"):
-        energies = getattr(torch_model.atomic_energies_fn, "atomic_energies", None)
-        if isinstance(energies, torch.Tensor):
-            torch_model.atomic_energies_fn.atomic_energies = energies.to(torch_dtype)
-    torch_model = torch_model.eval()
-
-    bundle = load_model_bundle(str(args.jax_model), dtype=args.dtype)
-    jax_wrapper = JaxMaceWrapper(
-        module=bundle.module,
-        config=bundle.config,
-        compute_force=False,
-        compute_stress=False,
-    )
-
-    wrapper_z_table = jax_wrapper.atomic_numbers
-    if wrapper_z_table is None:
-        atomic_numbers = _extract_atomic_numbers(torch_model, bundle)
-        z_table = AtomicNumberTable(atomic_numbers)
-    else:
-        z_table = wrapper_z_table
-
-    r_max = jax_wrapper.r_max
-    if r_max is None:
-        r_max = _extract_r_max(torch_model, bundle)
-
     h5_files = sorted(args.data_dir.glob("*.h5"))
     if args.split != "all":
         h5_files = [p for p in h5_files if p.stem == args.split]
@@ -271,68 +234,53 @@ def main() -> None:
         )
 
     try:
-        with torch.no_grad():
-            for h5_path in h5_files:
-                loader = _build_loader(h5_path, z_table, r_max, args.batch_size)
-                for batch_id, batch in enumerate(
-                    tqdm(loader, desc=f"compare {h5_path.name}", leave=False)
-                ):
-                    batch = batch.to(device)
-                    batch = _cast_batch(batch, torch_dtype)
+        for h5_path in h5_files:
+            with torch.no_grad():
+                energy_torch = _predict_torch(args, h5_path)
+            energy_jax = _predict_jax(args, h5_path)
 
-                    torch_pred = _extract_energy(_forward_torch(torch_model, batch))
-                    energy_torch = torch_pred.detach().cpu().numpy()
+            if energy_torch.shape != energy_jax.shape:
+                raise RuntimeError(
+                    f"Energy shape mismatch for {h5_path.name}: "
+                    f"Torch {energy_torch.shape} vs JAX {energy_jax.shape}"
+                )
 
-                    batch_jax = _batch_to_jax(batch)
-                    jax_pred = jax_wrapper.apply(
-                        bundle.params,
-                        batch_jax,
-                        compute_force=False,
-                        compute_stress=False,
-                    )
-                    energy_jax = np.asarray(jax_pred["energy"])
+            total_graphs += energy_torch.shape[0]
+            diff = np.abs(energy_torch - energy_jax)
+            scale = np.maximum(
+                np.maximum(np.abs(energy_torch), np.abs(energy_jax)), 1e-12
+            )
+            rel_diff = diff / scale
+            batch_max_rel = float(rel_diff.max(initial=0.0))
+            batch_max_abs = float(diff.max(initial=0.0))
+            max_rel_diff = max(max_rel_diff, batch_max_rel)
+            max_abs_diff = max(max_abs_diff, batch_max_abs)
 
-                    if energy_torch.shape != energy_jax.shape:
-                        raise RuntimeError(
-                            f"Energy shape mismatch: Torch {energy_torch.shape} vs JAX {energy_jax.shape}"
+            for idx, (delta, rel_delta, scale_val, e_t, e_j) in enumerate(
+                zip(diff, rel_diff, scale, energy_torch, energy_jax)
+            ):
+                if rel_delta > args.energy_tol:
+                    flagged = True
+                    if args.verbose:
+                        tqdm.write(
+                            f"[WARN] {h5_path.name} graph #{idx}: "
+                            f"|ΔE|/scale={rel_delta:.3e} exceeds tol {args.energy_tol:.1e} "
+                            f"(abs={delta:.3e} eV, scale={scale_val:.3e}, torch={e_t:.6f}, jax={e_j:.6f})"
                         )
-
-                    total_graphs += energy_torch.shape[0]
-                    diff = np.abs(energy_torch - energy_jax)
-                    scale = np.maximum(
-                        np.maximum(np.abs(energy_torch), np.abs(energy_jax)), 1e-12
+                if diff_writer is not None:
+                    diff_writer.writerow(
+                        [
+                            h5_path.name,
+                            int(idx),
+                            "",
+                            float(delta),
+                            float(rel_delta),
+                            float(e_t),
+                            float(e_j),
+                        ]
                     )
-                    rel_diff = diff / scale
-                    batch_max_rel = float(rel_diff.max(initial=0.0))
-                    batch_max_abs = float(diff.max(initial=0.0))
-                    max_rel_diff = max(max_rel_diff, batch_max_rel)
-                    max_abs_diff = max(max_abs_diff, batch_max_abs)
-
-                    indices = _graph_indices(batch, len(rel_diff))
-                    for idx, delta, rel_delta, scale_val, e_t, e_j in zip(
-                        indices, diff, rel_diff, scale, energy_torch, energy_jax
-                    ):
-                        if rel_delta > args.energy_tol:
-                            flagged = True
-                            tqdm.write(
-                                f"[WARN] {h5_path.name} graph #{idx} batch {batch_id}: "
-                                f"|ΔE|/scale={rel_delta:.3e} exceeds tol {args.energy_tol:.1e} "
-                                f"(abs={delta:.3e} eV, scale={scale_val:.3e}, torch={e_t:.6f}, jax={e_j:.6f})"
-                            )
-                        if diff_writer is not None:
-                            diff_writer.writerow(
-                                [
-                                    h5_path.name,
-                                    int(idx),
-                                    int(batch_id),
-                                    float(delta),
-                                    float(rel_delta),
-                                    float(e_t),
-                                    float(e_j),
-                                ]
-                            )
-                            diff_file.flush()
-                            diff_count += 1
+                    diff_file.flush()
+                    diff_count += 1
     finally:
         if diff_file is not None:
             diff_file.close()
