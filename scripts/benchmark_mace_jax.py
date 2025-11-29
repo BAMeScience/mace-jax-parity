@@ -97,8 +97,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--prefetch-batches",
         type=int,
-        default=0,
-        help="If >0, build padded JAX batches ahead of time (queue size = value).",
+        default=None,
+        help="If unset, defaults to the number of JAX loader workers. "
+        "Controls how many padded batches are buffered ahead of time.",
     )
     parser.add_argument(
         "--num-workers",
@@ -413,6 +414,11 @@ def main() -> None:
     if args.multi_gpu:
         effective_workers *= max(jax.local_device_count(), 1)
 
+    if args.prefetch_batches is None:
+        prefetch_batches = effective_workers
+    else:
+        prefetch_batches = max(int(args.prefetch_batches or 0), 0)
+
     jax_loader = get_dataloader_jax(
         data_file=h5_files,
         atomic_numbers=z_table,
@@ -424,7 +430,7 @@ def main() -> None:
         seed=None,
         niggli_reduce=False,
         max_batches=args.max_batches,
-        prefetch_batches=args.prefetch_batches,
+        prefetch_batches=prefetch_batches,
         num_workers=effective_workers,
         graph_multiple=device_multiplier,
     )
