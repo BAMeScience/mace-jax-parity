@@ -14,21 +14,34 @@ import time
 from pathlib import Path
 
 import jax
-import jax.numpy as jnp
 import jraph
 import numpy as np
 import torch
-from jax import tree_util as jtu
 from torch.serialization import add_safe_globals
 from tqdm import tqdm
 
 from equitrain.backends.jax_utils import (
+    batched_iterator,
+    iter_micro_batches,
     load_model_bundle,
     replicate_to_local_devices,
+    supports_multiprocessing_workers,
+    take_chunk,
 )
+from equitrain.backends.jax_utils import (
+    prepare_sharded_batch as _prepare_sharded_batch,
+)
+from equitrain.backends.jax_utils import (
+    prepare_single_batch as _prepare_single_batch,
+)
+from equitrain.backends.jax_wrappers import MaceWrapper as JaxMaceWrapper
 from equitrain.data.atomic import AtomicNumberTable
-from equitrain.data.backend_jax import get_dataloader as get_dataloader_jax
-from equitrain.data.backend_jax.atoms_to_graphs import graph_to_data
+from equitrain.data.backend_jax import (
+    get_dataloader as get_dataloader_jax,
+)
+from equitrain.data.backend_jax import (
+    make_apply_fn,
+)
 
 add_safe_globals([slice])
 
@@ -155,39 +168,9 @@ def _extract_r_max(torch_model, jax_bundle):
     raise RuntimeError("Unable to infer r_max from the provided models.")
 
 
-def _graph_to_jax_data(graph, num_species: int, jnp_dtype):
-    data = graph_to_data(graph, num_species=num_species)
-    casted = {}
-    for k, v in data.items():
-        if hasattr(v, "dtype") and v.dtype.kind == "f":
-            casted[k] = v.astype(jnp_dtype)
-        else:
-            casted[k] = v
-    return jax.device_put(casted)
-
-
 def _count_real_graphs(graph: jraph.GraphsTuple) -> int:
     mask = np.asarray(jraph.get_graph_padding_mask(graph))
     return int(np.sum(mask))
-
-
-def _prepare_multi_device_batch(
-    graphs: list[jraph.GraphsTuple],
-    num_species: int,
-    jnp_dtype,
-):
-    device_batches = [
-        _graph_to_jax_data(graph, num_species=num_species, jnp_dtype=jnp_dtype)
-        for graph in graphs
-    ]
-
-    def _stack_or_none(*values):
-        first = values[0]
-        if first is None:
-            return None
-        return jnp.stack(values)
-
-    return jtu.tree_map(_stack_or_none, *device_batches)
 
 
 def _setup_jax(enable_x64: bool):
@@ -199,33 +182,32 @@ def _setup_jax(enable_x64: bool):
         pass
 
 
+def _build_apply_fn(bundle, num_species: int):
+    wrapper = JaxMaceWrapper(
+        module=bundle.module,
+        config=bundle.config,
+        compute_force=False,
+        compute_stress=False,
+    )
+    return make_apply_fn(wrapper, num_species=num_species)
+
+
 def _benchmark_jax(
     bundle,
+    apply_fn,
     loader,
-    num_species,
-    dtype,
     max_batches,
     *,
     multi_gpu: bool,
 ):
     wall_start = time.perf_counter()
-    jnp_dtype = jnp.dtype(dtype)
-
-    def _apply_fn(params, batch):
-        return bundle.module.apply(
-            params,
-            batch,
-            compute_force=False,
-            compute_stress=False,
-        )
-
-    jit_apply = jax.jit(_apply_fn)
+    jit_apply = jax.jit(apply_fn)
     num_devices = jax.local_device_count() if multi_gpu else 1
     use_pmap = multi_gpu and num_devices > 1
     pmap_apply = None
     params_for_apply = bundle.params
     if use_pmap:
-        pmap_apply = jax.pmap(_apply_fn, axis_name="devices")
+        pmap_apply = jax.pmap(apply_fn, axis_name="devices")
         params_for_apply = replicate_to_local_devices(bundle.params)
 
     total_graphs = 0
@@ -254,22 +236,10 @@ def _benchmark_jax(
             f"WARNING: dropped {dropped_graphs} graphs exceeding the configured limits."
         )
 
-    def _iter_micro_batches():
-        for item in loader:
-            if isinstance(item, list):
-                for sub in item:
-                    if sub is not None:
-                        yield sub
-            elif item is not None:
-                yield item
-
-    micro_iter = _iter_micro_batches()
+    micro_iter = iter_micro_batches(loader)
     group_size = num_devices if use_pmap else 1
 
-    def _take_chunk(iterator, size: int):
-        return list(itertools.islice(iterator, size))
-
-    first_chunk = _take_chunk(micro_iter, group_size)
+    first_chunk = take_chunk(micro_iter, group_size)
     if use_pmap and len(first_chunk) < group_size:
         tqdm.write(
             "[JAX] Disabling multi-GPU: insufficient micro-batches for the device count."
@@ -280,39 +250,32 @@ def _benchmark_jax(
         group_size = 1
         progress_total = total_batches
         params_for_apply = bundle.params
-        first_chunk = _take_chunk(micro_iter, group_size)
+        first_chunk = take_chunk(micro_iter, group_size)
 
     first_chunk = [g for g in first_chunk if g is not None]
     if not first_chunk:
         return total_graphs, batches_seen, compile_time, wall_start
 
-    def _batched_iter(iterator, size: int):
-        while True:
-            chunk = _take_chunk(iterator, size)
-            if len(chunk) < size:
-                if chunk:
-                    tqdm.write(
-                        "[JAX] Dropping incomplete multi-device chunk "
-                        f"({len(chunk)}/{size})."
-                    )
-                break
-            yield chunk
+    def _warn_incomplete(count: int, expected: int):
+        tqdm.write(
+            f"[JAX] Dropping incomplete multi-device chunk ({count}/{expected})."
+        )
 
-    remaining_iter = _batched_iter(micro_iter, group_size)
+    remainder_iter = batched_iterator(
+        micro_iter,
+        group_size,
+        remainder_action=_warn_incomplete if use_pmap else None,
+    )
     chunk_iter = (
-        itertools.chain([first_chunk], remaining_iter)
+        itertools.chain([first_chunk], remainder_iter)
         if first_chunk
-        else remaining_iter
+        else remainder_iter
     )
 
     def _prepare_chunk(graphs_chunk: list[jraph.GraphsTuple]):
         if use_pmap:
-            return _prepare_multi_device_batch(
-                graphs_chunk, num_species=num_species, jnp_dtype=jnp_dtype
-            )
-        return _graph_to_jax_data(
-            graphs_chunk[0], num_species=num_species, jnp_dtype=jnp_dtype
-        )
+            return _prepare_sharded_batch(graphs_chunk, num_devices)
+        return _prepare_single_batch(graphs_chunk[0])
 
     warm_start = time.perf_counter()
     warm_batch = _prepare_chunk(first_chunk)
@@ -410,9 +373,11 @@ def main() -> None:
 
     prep_start = time.perf_counter()
     device_multiplier = jax.local_device_count() if args.multi_gpu else 1
-    effective_workers = max(int(args.num_workers or 0), 0)
-    if args.multi_gpu:
-        effective_workers *= max(jax.local_device_count(), 1)
+    base_workers = max(int(args.num_workers or 0), 0)
+    if base_workers > 0 and supports_multiprocessing_workers():
+        effective_workers = base_workers * max(device_multiplier, 1)
+    else:
+        effective_workers = 0
 
     if args.prefetch_batches is None:
         prefetch_batches = effective_workers
@@ -439,6 +404,8 @@ def main() -> None:
         "(streaming from HDF5)"
     )
 
+    apply_fn = _build_apply_fn(bundle, len(atomic_numbers))
+
     (
         jax_graphs,
         jax_batches,
@@ -446,9 +413,8 @@ def main() -> None:
         jax_wall_time,
     ) = _benchmark_jax(
         bundle,
+        apply_fn,
         jax_loader,
-        len(atomic_numbers),
-        args.dtype,
         args.max_batches,
         multi_gpu=args.multi_gpu,
     )
