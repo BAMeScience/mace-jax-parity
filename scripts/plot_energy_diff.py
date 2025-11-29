@@ -4,19 +4,20 @@ Quick helper to visualise energy differences recorded by compare_mace_torch_jax.
 
 Usage
 -----
-    python scripts/plot_energy_diff.py --csv energy_diffs.csv --out energy_diff.png
+    python scripts/plot_energy_diff.py \
+        --cpu-csv results/compare_cpu.csv \
+        --gpu-csv results/compare_gpu.csv \
+        --out results/energy_diff.png
 
-The input CSV is expected to have the header:
-    file,graph_index,batch_id,delta_e,torch_energy,jax_energy
-as written by the compare script. Two plots are produced in one figure:
-  1) Histogram of |ΔE| values.
-  2) Scatter of Torch vs JAX energies with a y=x reference line.
+Both CSVs are expected to follow the schema written by compare_mace_torch_jax.py:
+    file,graph_index,batch_id,delta_e,rel_delta,torch_energy,jax_energy
+The script creates two histograms (CPU + GPU) of the relative |ΔE|/scale values for quick
+visual comparison.
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -24,12 +25,18 @@ import numpy as np
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Plot energy differences from CSV.")
+    parser = argparse.ArgumentParser(description="Plot CPU/GPU energy difference histograms.")
     parser.add_argument(
-        "--csv",
+        "--cpu-csv",
         type=Path,
         required=True,
-        help="Path to energy_diffs.csv created by compare_mace_torch_jax.py.",
+        help="CSV with CPU comparison results (compare_mace_torch_jax.py --device cpu).",
+    )
+    parser.add_argument(
+        "--gpu-csv",
+        type=Path,
+        required=True,
+        help="CSV with GPU comparison results (compare_mace_torch_jax.py --device cuda).",
     )
     parser.add_argument(
         "--out",
@@ -41,49 +48,51 @@ def _parse_args() -> argparse.Namespace:
         "--bins",
         type=int,
         default=100,
-        help="Number of bins for the ΔE histogram (default: 100).",
+        help="Number of bins for the histogram (default: 100).",
     )
     return parser.parse_args()
 
 
-def _load(csv_path: Path):
-    delta = []
-    torch_e = []
-    jax_e = []
-    with csv_path.open() as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            delta.append(float(row["delta_e"]))
-            torch_e.append(float(row["torch_energy"]))
-            jax_e.append(float(row["jax_energy"]))
-    return (
-        np.asarray(delta, dtype=np.float64),
-        np.asarray(torch_e, dtype=np.float64),
-        np.asarray(jax_e, dtype=np.float64),
+def _load_rel_diff(csv_path: Path) -> np.ndarray:
+    data = np.genfromtxt(
+        csv_path,
+        delimiter=",",
+        names=True,
+        dtype=None,
+        encoding="utf-8",
     )
+    if data.size == 0:
+        return np.asarray([], dtype=np.float64)
+    rel = np.asarray(data["rel_delta"], dtype=np.float64)
+    return np.abs(rel)
 
 
 def main() -> None:
     args = _parse_args()
-    delta, torch_e, jax_e = _load(args.csv)
+    cpu_delta = _load_rel_diff(args.cpu_csv)
+    gpu_delta = _load_rel_diff(args.gpu_csv)
 
-    fig, (ax_hist, ax_scatter) = plt.subplots(1, 2, figsize=(12, 5))
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5), sharey=True)
 
-    # Histogram of absolute differences.
-    ax_hist.hist(np.abs(delta), bins=args.bins, color="steelblue", alpha=0.8)
-    ax_hist.set_xlabel("|ΔE| [eV]")
-    ax_hist.set_ylabel("Count")
-    ax_hist.set_title("Energy difference distribution")
+    hist_specs = [
+        (cpu_delta, "CPU comparison", axes[0], "steelblue"),
+        (gpu_delta, "GPU comparison", axes[1], "darkorange"),
+    ]
 
-    # Scatter Torch vs JAX with y=x line.
-    min_e = min(torch_e.min(), jax_e.min())
-    max_e = max(torch_e.max(), jax_e.max())
-    ax_scatter.plot([min_e, max_e], [min_e, max_e], "k--", linewidth=1, label="y=x")
-    ax_scatter.scatter(torch_e, jax_e, s=6, alpha=0.6, color="darkorange")
-    ax_scatter.set_xlabel("Torch energy [eV]")
-    ax_scatter.set_ylabel("JAX energy [eV]")
-    ax_scatter.set_title("Torch vs JAX energies")
-    ax_scatter.legend()
+    eps = 1e-18
+    for delta_data, title, ax, color in hist_specs:
+        positive = delta_data[delta_data > 0]
+        if positive.size == 0:
+            positive = np.array([eps])
+        min_edge = max(positive.min(), eps)
+        max_edge = max(positive.max(), min_edge * 10)
+        bins = np.logspace(np.log10(min_edge), np.log10(max_edge), args.bins)
+        ax.hist(positive, bins=bins, color=color, alpha=0.8)
+        ax.set_xscale("log")
+        ax.set_xlabel("|ΔE|/scale (unitless)")
+        ax.set_ylabel("Count")
+        ax.set_title(title)
+        ax.grid(alpha=0.2, linestyle="--")
 
     fig.tight_layout()
     args.out.parent.mkdir(parents=True, exist_ok=True)

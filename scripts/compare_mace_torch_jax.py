@@ -89,7 +89,7 @@ def _parse_args() -> argparse.Namespace:
         "--device",
         type=str,
         default="cpu",
-        help="Device for the Torch model/data (default: cpu).",
+        help="Device for model execution (Torch and JAX). Examples: cpu, cuda, cuda:0.",
     )
     parser.add_argument(
         "--diff-csv",
@@ -148,8 +148,20 @@ def _predict_jax(args, predict_file: Path):
     predict_args = _make_predict_args(
         args, backend="jax", model_path=args.jax_model, predict_file=predict_file
     )
+    predict_args.jax_platform = _device_to_jax_platform(args.device)
     energy, _, _ = jax_predict(predict_args)
     return np.asarray(energy)
+
+
+def _device_to_jax_platform(device_spec: str) -> str:
+    spec = (device_spec or "cpu").strip().lower()
+    if spec.startswith("cpu"):
+        return "cpu"
+    if spec.startswith("cuda") or spec.startswith("gpu"):
+        return "gpu"
+    if spec.startswith("tpu"):
+        return "tpu"
+    raise ValueError(f"Unsupported device specification for JAX: {device_spec}")
 
 
 def _predict_torch_gpu(predict_args, predict_file: Path, device: torch.device):
