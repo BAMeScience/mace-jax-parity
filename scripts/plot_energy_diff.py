@@ -22,6 +22,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+from csv import DictReader
 
 
 def _parse_args() -> argparse.Namespace:
@@ -50,21 +51,26 @@ def _parse_args() -> argparse.Namespace:
         default=100,
         help="Number of bins for the histogram (default: 100).",
     )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="float32",
+        help="Annotate the plot with the dtype used for comparison (default: float32).",
+    )
     return parser.parse_args()
 
 
 def _load_rel_diff(csv_path: Path) -> np.ndarray:
-    data = np.genfromtxt(
-        csv_path,
-        delimiter=",",
-        names=True,
-        dtype=None,
-        encoding="utf-8",
-    )
-    if data.size == 0:
-        return np.asarray([], dtype=np.float64)
-    rel = np.asarray(data["rel_delta"], dtype=np.float64)
-    return np.abs(rel)
+    values = []
+    with csv_path.open() as handle:
+        reader = DictReader(handle)
+        for row in reader:
+            try:
+                rel = float(row.get("rel_delta", 0.0))
+            except (TypeError, ValueError):
+                continue
+            values.append(abs(rel))
+    return np.asarray(values, dtype=np.float64)
 
 
 def main() -> None:
@@ -94,7 +100,8 @@ def main() -> None:
         ax.set_title(title)
         ax.grid(alpha=0.2, linestyle="--")
 
-    fig.tight_layout()
+    fig.suptitle(f"Relative energy differences (dtype={args.dtype})", fontsize=14)
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
     args.out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(args.out, dpi=150)
     print(f"Saved plot to {args.out}")
