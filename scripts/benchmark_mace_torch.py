@@ -8,6 +8,7 @@ with `accelerate launch` to spawn one process per GPU).
 from __future__ import annotations
 
 import argparse
+import csv
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -76,6 +77,12 @@ def _parse_args() -> argparse.Namespace:
         "--multi-gpu",
         action="store_true",
         help="Deprecated flag kept for backwards compatibility (no-op).",
+    )
+    parser.add_argument(
+        "--csv-output",
+        type=Path,
+        default=None,
+        help="If set, append the final benchmark summary to this CSV file.",
     )
     return parser.parse_args()
 
@@ -179,6 +186,29 @@ def _benchmark_torch(
     return total_graphs, total_batches, total_wall
 
 
+def _write_results_csv(path: Path, row: dict):
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not path.exists() or path.stat().st_size == 0
+    headers = [
+        "backend",
+        "split",
+        "dtype",
+        "device",
+        "graphs",
+        "batches",
+        "wall_time_s",
+        "throughput_graphs_per_s",
+        "compile_time_s",
+    ]
+    with path.open("a", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=headers)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
 def main() -> None:
     args = _parse_args()
     accelerator = Accelerator(split_batches=False)
@@ -254,6 +284,21 @@ def main() -> None:
                 f"in {wall:.3f}s (wall, includes all prep/compute) => "
                 f"{throughput:.2f} graphs/s"
             )
+            if args.csv_output is not None:
+                _write_results_csv(
+                    args.csv_output,
+                    {
+                        "backend": "torch",
+                        "split": args.split,
+                        "dtype": args.dtype,
+                        "device": args.device,
+                        "graphs": int(graphs),
+                        "batches": int(batches),
+                        "wall_time_s": wall,
+                        "throughput_graphs_per_s": throughput,
+                        "compile_time_s": "",
+                    },
+                )
             if args.multi_gpu and accelerator.num_processes == 1:
                 print(
                     "[Torch] '--multi-gpu' was set but only one process/device is active. "

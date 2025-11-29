@@ -9,6 +9,7 @@ the reference model so we can extract shared metadata such as atomic numbers.
 from __future__ import annotations
 
 import argparse
+import csv
 import itertools
 import time
 from pathlib import Path
@@ -124,6 +125,12 @@ def _parse_args() -> argparse.Namespace:
         "--multi-gpu",
         action="store_true",
         help="Use all available GPUs via pmap (requires batch divisible by device count).",
+    )
+    parser.add_argument(
+        "--csv-output",
+        type=Path,
+        default=None,
+        help="If set, append the final benchmark summary to this CSV file.",
     )
     return parser.parse_args()
 
@@ -334,6 +341,29 @@ def _benchmark_jax(
     return total_graphs, batches_seen, compile_time, wall_time
 
 
+def _write_results_csv(path: Path, row: dict):
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not path.exists() or path.stat().st_size == 0
+    headers = [
+        "backend",
+        "split",
+        "dtype",
+        "device",
+        "graphs",
+        "batches",
+        "wall_time_s",
+        "throughput_graphs_per_s",
+        "compile_time_s",
+    ]
+    with path.open("a", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=headers)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
 def _load_torch_model(args, device: torch.device, torch_dtype):
     model = torch.load(
         args.torch_model,
@@ -429,6 +459,25 @@ def main() -> None:
     )
     if jax_compile is not None:
         print(f"JAX compile+first-step time: {jax_compile:.3f}s")
+    if args.csv_output is not None:
+        throughput = _throughput(jax_graphs, jax_wall_time)
+        device_label = (
+            f"{jax.default_backend()}(pmap)" if args.multi_gpu else jax.default_backend()
+        )
+        _write_results_csv(
+            args.csv_output,
+            {
+                "backend": "jax",
+                "split": args.split,
+                "dtype": args.dtype,
+                "device": device_label,
+                "graphs": int(jax_graphs),
+                "batches": int(jax_batches),
+                "wall_time_s": jax_wall_time,
+                "throughput_graphs_per_s": throughput,
+                "compile_time_s": jax_compile if jax_compile is not None else "",
+            },
+        )
 
 
 if __name__ == "__main__":
