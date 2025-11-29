@@ -6,8 +6,15 @@ all:
 
 ################################################################################
 
-compare: models/mace_jax_bundle
-	python scripts/compare_mace_torch_jax.py --torch-model models/mace_foundation.pt --jax-model models/mace_jax_bundle/ --data-dir data/mptraj --dtype float32 --split valid
+compare: compare-cpu compare-gpu
+
+compare-cpu: models/mace_jax_bundle
+	mkdir -p results
+	python scripts/compare_mace_torch_jax.py --torch-model models/mace_foundation.pt --jax-model models/mace_jax_bundle/ --data-dir data/mptraj --dtype float32 --split valid --device cpu --diff-csv results/compare_cpu.csv
+
+compare-gpu: models/mace_jax_bundle
+	mkdir -p results
+	python scripts/compare_mace_torch_jax.py --torch-model models/mace_foundation.pt --jax-model models/mace_jax_bundle/ --data-dir data/mptraj --dtype float32 --split valid --device cuda --diff-csv results/compare_gpu.csv
 
 ################################################################################
 

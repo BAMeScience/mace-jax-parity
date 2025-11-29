@@ -35,6 +35,7 @@ if callable(add_safe_globals):  # pragma: no cover - guard for torch<2.6
     add_safe_globals(safe_globals)
 
 from equitrain.backends.jax_utils import load_model_bundle
+from equitrain.backends.jax_wrappers import MaceWrapper as JaxMaceWrapper
 from equitrain.data.atomic import AtomicNumberTable
 from equitrain.data.format_hdf5 import HDF5GraphDataset
 
@@ -77,7 +78,7 @@ def _parse_args() -> argparse.Namespace:
         "--energy-tol",
         type=float,
         default=1e-5,
-        help="Absolute tolerance (in eV) before reporting a discrepancy (default: 1e-5).",
+        help="Relative tolerance (unitless) before reporting a discrepancy (default: 1e-5).",
     )
     parser.add_argument(
         "--dtype",
@@ -221,11 +222,23 @@ def main() -> None:
     torch_model = torch_model.eval()
 
     bundle = load_model_bundle(str(args.jax_model), dtype=args.dtype)
+    jax_wrapper = JaxMaceWrapper(
+        module=bundle.module,
+        config=bundle.config,
+        compute_force=False,
+        compute_stress=False,
+    )
 
-    atomic_numbers = _extract_atomic_numbers(torch_model, bundle)
-    r_max = _extract_r_max(torch_model, bundle)
+    wrapper_z_table = jax_wrapper.atomic_numbers
+    if wrapper_z_table is None:
+        atomic_numbers = _extract_atomic_numbers(torch_model, bundle)
+        z_table = AtomicNumberTable(atomic_numbers)
+    else:
+        z_table = wrapper_z_table
 
-    z_table = AtomicNumberTable(atomic_numbers)
+    r_max = jax_wrapper.r_max
+    if r_max is None:
+        r_max = _extract_r_max(torch_model, bundle)
 
     h5_files = sorted(args.data_dir.glob("*.h5"))
     if args.split != "all":
@@ -234,7 +247,8 @@ def main() -> None:
         raise FileNotFoundError(f"No HDF5 files found under {args.data_dir}")
 
     total_graphs = 0
-    max_diff = 0.0
+    max_rel_diff = 0.0
+    max_abs_diff = 0.0
     flagged = False
     diff_count = 0
     diff_file = None
@@ -245,7 +259,15 @@ def main() -> None:
         diff_file = diff_path.open("w", newline="")
         diff_writer = csv.writer(diff_file)
         diff_writer.writerow(
-            ["file", "graph_index", "batch_id", "delta_e", "torch_energy", "jax_energy"]
+            [
+                "file",
+                "graph_index",
+                "batch_id",
+                "delta_e",
+                "rel_delta",
+                "torch_energy",
+                "jax_energy",
+            ]
         )
 
     try:
@@ -262,7 +284,7 @@ def main() -> None:
                     energy_torch = torch_pred.detach().cpu().numpy()
 
                     batch_jax = _batch_to_jax(batch)
-                    jax_pred = bundle.module.apply(
+                    jax_pred = jax_wrapper.apply(
                         bundle.params,
                         batch_jax,
                         compute_force=False,
@@ -277,19 +299,25 @@ def main() -> None:
 
                     total_graphs += energy_torch.shape[0]
                     diff = np.abs(energy_torch - energy_jax)
-                    batch_max = float(diff.max(initial=0.0))
-                    max_diff = max(max_diff, batch_max)
+                    scale = np.maximum(
+                        np.maximum(np.abs(energy_torch), np.abs(energy_jax)), 1e-12
+                    )
+                    rel_diff = diff / scale
+                    batch_max_rel = float(rel_diff.max(initial=0.0))
+                    batch_max_abs = float(diff.max(initial=0.0))
+                    max_rel_diff = max(max_rel_diff, batch_max_rel)
+                    max_abs_diff = max(max_abs_diff, batch_max_abs)
 
-                    indices = _graph_indices(batch, len(diff))
-                    for idx, delta, e_t, e_j in zip(
-                        indices, diff, energy_torch, energy_jax
+                    indices = _graph_indices(batch, len(rel_diff))
+                    for idx, delta, rel_delta, scale_val, e_t, e_j in zip(
+                        indices, diff, rel_diff, scale, energy_torch, energy_jax
                     ):
-                        if delta > args.energy_tol:
+                        if rel_delta > args.energy_tol:
                             flagged = True
                             tqdm.write(
                                 f"[WARN] {h5_path.name} graph #{idx} batch {batch_id}: "
-                                f"|ΔE|={delta:.3e} eV exceeds tol {args.energy_tol:.1e} "
-                                f"(torch={e_t:.6f}, jax={e_j:.6f})"
+                                f"|ΔE|/scale={rel_delta:.3e} exceeds tol {args.energy_tol:.1e} "
+                                f"(abs={delta:.3e} eV, scale={scale_val:.3e}, torch={e_t:.6f}, jax={e_j:.6f})"
                             )
                         if diff_writer is not None:
                             diff_writer.writerow(
@@ -298,6 +326,7 @@ def main() -> None:
                                     int(idx),
                                     int(batch_id),
                                     float(delta),
+                                    float(rel_delta),
                                     float(e_t),
                                     float(e_j),
                                 ]
@@ -309,15 +338,16 @@ def main() -> None:
             diff_file.close()
 
     print(
-        f"Compared {total_graphs} graphs across {len(h5_files)} files. Max |ΔE|={max_diff:.3e} eV"
+        f"Compared {total_graphs} graphs across {len(h5_files)} files. "
+        f"Max relative |ΔE|/scale={max_rel_diff:.3e}, max absolute |ΔE|={max_abs_diff:.3e} eV"
     )
     if not flagged:
         print(
-            f"✅ No discrepancies larger than {args.energy_tol:.1e} eV detected between Torch and JAX predictions."
+            f"✅ No discrepancies with relative error above {args.energy_tol:.1e} detected between Torch and JAX predictions."
         )
     else:
         print(
-            f"⚠️ Energy discrepancies exceeded {args.energy_tol:.1e} eV. "
+            f"⚠️ Relative energy discrepancies exceeded {args.energy_tol:.1e}. "
             "See warnings above for affected graphs."
         )
     if diff_writer is not None and args.diff_csv is not None:
