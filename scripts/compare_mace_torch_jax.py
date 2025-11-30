@@ -137,6 +137,7 @@ def _predict_torch(args, predict_file: Path):
     predict_args = _make_predict_args(
         args, backend="torch", model_path=args.torch_model, predict_file=predict_file
     )
+    predict_args.tqdm = True
     device = torch.device(args.device)
     if device.type == "cpu":
         energy, _, _ = torch_predict_impl(predict_args, device=device)
@@ -149,6 +150,7 @@ def _predict_jax(args, predict_file: Path):
         args, backend="jax", model_path=args.jax_model, predict_file=predict_file
     )
     predict_args.jax_platform = _device_to_jax_platform(args.device)
+    predict_args.tqdm = True
     energy, _, _ = jax_predict(predict_args)
     return np.asarray(energy)
 

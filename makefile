@@ -10,7 +10,6 @@ all:
 compare: compare32 compare64
 compare32: compare-cpu compare-gpu
 compare64: compare64-cpu compare64-gpu
-plot: plot-energy
 
 compare-cpu: models/mace_jax_bundle
 	mkdir -p results
@@ -42,7 +41,8 @@ benchmark-jax: models/mace_jax_bundle
 
 plot-comparison:
 	mkdir -p results
-	python scripts/plot_energy_diff.py --cpu-csv results/compare_cpu.csv --gpu-csv results/compare_gpu.csv --out results/energy_diff.png
+	python scripts/plot_energy_diff.py --cpu-csv results/compare_cpu_f32.csv --gpu-csv results/compare_gpu_f32.csv --out results/energy_diff_f32.png --dtype float32
+	python scripts/plot_energy_diff.py --cpu-csv results/compare_cpu_f64.csv --gpu-csv results/compare_gpu_f64.csv --out results/energy_diff_f64.png --dtype float64
 
 ################################################################################
 
