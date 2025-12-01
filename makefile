@@ -8,14 +8,14 @@ all:
 ################################################################################
 
 compare: compare32 compare64
-compare32: compare-cpu compare-gpu
+compare32: compare32-cpu compare32-gpu
 compare64: compare64-cpu compare64-gpu
 
-compare-cpu: models/mace_jax_bundle
+compare32-cpu: models/mace_jax_bundle
 	mkdir -p results
 	python scripts/compare_mace_torch_jax.py --torch-model models/mace_foundation.pt --jax-model models/mace_jax_bundle/ --data-dir data/mptraj --dtype float32 --split valid --device cpu --diff-csv results/compare_cpu_f32.csv
 
-compare-gpu: models/mace_jax_bundle
+compare32-gpu: models/mace_jax_bundle
 	mkdir -p results
 	python scripts/compare_mace_torch_jax.py --torch-model models/mace_foundation.pt --jax-model models/mace_jax_bundle/ --data-dir data/mptraj --dtype float32 --split valid --device cuda --diff-csv results/compare_gpu_f32.csv
 
