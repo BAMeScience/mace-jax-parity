@@ -44,6 +44,9 @@ def _load_torch_model(
     model: str | None,
     device: str,
     default_dtype: str,
+    *,
+    enable_cueq: bool,
+    only_cueq: bool,
 ) -> torch.nn.Module:
     """
     Instantiate a Torch foundation model for the requested family.
@@ -51,33 +54,36 @@ def _load_torch_model(
 
     loader = FOUNDATION_LOADERS[family]
 
+    loader_kwargs = dict(
+        device=device,
+        default_dtype=default_dtype,
+        return_raw_model=True,
+    )
+    if enable_cueq:
+        loader_kwargs["enable_cueq"] = True
+    if only_cueq:
+        loader_kwargs["only_cueq"] = True
+
     if family == "mp":
         return loader(
             model=model,
-            device=device,
-            default_dtype=default_dtype,
-            return_raw_model=True,
+            **loader_kwargs,
         )
     if family == "off":
         return loader(
             model=model,
-            device=device,
-            default_dtype=default_dtype,
-            return_raw_model=True,
+            **loader_kwargs,
         )
     if family == "omol":
         return loader(
             model=model,
-            device=device,
-            default_dtype=default_dtype,
-            return_raw_model=True,
+            **loader_kwargs,
         )
 
     # ANIcc helper accepts ``model_path`` instead of ``model``.
     return loader(
-        device=device,
         model_path=model,
-        return_raw_model=True,
+        **loader_kwargs,
     )
 
 
@@ -118,6 +124,16 @@ def _parse_args() -> argparse.Namespace:
         default=Path("models/mace_foundation.pt"),
         help="Destination file for the serialized torch.nn.Module.",
     )
+    parser.add_argument(
+        "--enable-cueq",
+        action="store_true",
+        help="Ask the foundation loader to enable cuEquivariance acceleration.",
+    )
+    parser.add_argument(
+        "--only-cueq",
+        action="store_true",
+        help="Restrict the model to cueEquivariance kernels only (where supported).",
+    )
     return parser.parse_args()
 
 
@@ -129,6 +145,8 @@ def main() -> None:
         model=args.model,
         device=args.device,
         default_dtype=args.default_dtype,
+        enable_cueq=bool(args.enable_cueq),
+        only_cueq=bool(args.only_cueq),
     )
     model = model.to("cpu")
     model = model.float().eval()

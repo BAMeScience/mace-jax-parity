@@ -207,7 +207,6 @@ def _benchmark_jax(
     *,
     multi_gpu: bool,
 ):
-    wall_start = time.perf_counter()
     jit_apply = jax.jit(apply_fn)
     num_devices = jax.local_device_count() if multi_gpu else 1
     use_pmap = multi_gpu and num_devices > 1
@@ -223,7 +222,7 @@ def _benchmark_jax(
     shape_hits: dict[tuple[int, int, int, int], int] = {}
 
     if loader is None:
-        return total_graphs, batches_seen, compile_time, wall_start
+        return total_graphs, batches_seen, compile_time, 0.0
 
     try:
         total_batches = len(loader)
@@ -261,7 +260,7 @@ def _benchmark_jax(
 
     first_chunk = [g for g in first_chunk if g is not None]
     if not first_chunk:
-        return total_graphs, batches_seen, compile_time, wall_start
+        return total_graphs, batches_seen, compile_time, 0.0
 
     def _warn_incomplete(count: int, expected: int):
         tqdm.write(
@@ -304,6 +303,7 @@ def _benchmark_jax(
         position=0,
     )
 
+    run_start = time.perf_counter()
     for chunk in pbar:
         if max_batches is not None and batches_seen >= max_batches:
             break
@@ -337,8 +337,9 @@ def _benchmark_jax(
         total_graphs += real_graphs
         batches_seen += 1
 
-    wall_time = time.perf_counter() - wall_start
-    return total_graphs, batches_seen, compile_time, wall_time
+    run_time = time.perf_counter() - run_start
+
+    return total_graphs, batches_seen, compile_time, run_time
 
 
 def _write_results_csv(path: Path, row: dict):
@@ -353,7 +354,7 @@ def _write_results_csv(path: Path, row: dict):
         "device",
         "graphs",
         "batches",
-        "wall_time_s",
+        "run_time_s",
         "throughput_graphs_per_s",
         "compile_time_s",
     ]
@@ -440,7 +441,7 @@ def main() -> None:
         jax_graphs,
         jax_batches,
         jax_compile,
-        jax_wall_time,
+        jax_time,
     ) = _benchmark_jax(
         bundle,
         apply_fn,
@@ -452,17 +453,19 @@ def main() -> None:
     def _throughput(graphs, elapsed):
         return graphs / elapsed if elapsed and graphs else 0.0
 
+    jax_throughput = _throughput(jax_graphs, jax_time)
     print(
         f"JAX [{args.dtype}]: {jax_graphs} graphs across {jax_batches} batches "
-        f"in {jax_wall_time:.3f}s (wall, includes compile) => "
-        f"{_throughput(jax_graphs, jax_wall_time):.2f} graphs/s"
+        f"in {jax_time:.3f}s => "
+        f"{jax_throughput:.2f} graphs/s"
     )
     if jax_compile is not None:
         print(f"JAX compile+first-step time: {jax_compile:.3f}s")
     if args.csv_output is not None:
-        throughput = _throughput(jax_graphs, jax_wall_time)
         device_label = (
-            f"{jax.default_backend()}(pmap)" if args.multi_gpu else jax.default_backend()
+            f"{jax.default_backend()}(pmap)"
+            if args.multi_gpu
+            else jax.default_backend()
         )
         _write_results_csv(
             args.csv_output,
@@ -473,8 +476,8 @@ def main() -> None:
                 "device": device_label,
                 "graphs": int(jax_graphs),
                 "batches": int(jax_batches),
-                "wall_time_s": jax_wall_time,
-                "throughput_graphs_per_s": throughput,
+                "run_time_s": jax_time,
+                "throughput_graphs_per_s": jax_throughput,
                 "compile_time_s": jax_compile if jax_compile is not None else "",
             },
         )

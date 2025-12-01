@@ -127,11 +127,11 @@ def _benchmark_torch(
 ):
     model = accelerator.prepare(model)
 
-    wall_start = time.perf_counter()
     local_graphs = 0
     local_batches = 0
 
     with torch.no_grad():
+        run_start = time.perf_counter()
         for h5_path, loader in loaders:
             prepared_loader = accelerator.prepare(loader)
             local_total = (
@@ -167,7 +167,7 @@ def _benchmark_torch(
             if max_batches is not None and local_batches >= max_batches:
                 break
 
-    wall_time_local = time.perf_counter() - wall_start
+        run_time = time.perf_counter() - run_start
 
     graphs_tensor = torch.tensor(
         local_graphs, device=accelerator.device, dtype=torch.float64
@@ -175,15 +175,11 @@ def _benchmark_torch(
     batches_tensor = torch.tensor(
         local_batches, device=accelerator.device, dtype=torch.float64
     )
-    wall_tensor = torch.tensor(
-        wall_time_local, device=accelerator.device, dtype=torch.float64
-    )
 
     total_graphs = accelerator.reduce(graphs_tensor, reduction="sum").item()
     total_batches = accelerator.reduce(batches_tensor, reduction="sum").item()
-    total_wall = accelerator.reduce(wall_tensor, reduction="max").item()
 
-    return total_graphs, total_batches, total_wall
+    return total_graphs, total_batches, run_time
 
 
 def _write_results_csv(path: Path, row: dict):
@@ -198,7 +194,7 @@ def _write_results_csv(path: Path, row: dict):
         "device",
         "graphs",
         "batches",
-        "wall_time_s",
+        "run_time_s",
         "throughput_graphs_per_s",
         "compile_time_s",
     ]
@@ -270,7 +266,7 @@ def main() -> None:
         raise RuntimeError("No Torch dataloaders could be built for the provided data")
 
     try:
-        graphs, batches, wall = _benchmark_torch(
+        graphs, batches, run_time = _benchmark_torch(
             accelerator,
             model,
             loaders,
@@ -278,10 +274,10 @@ def main() -> None:
         )
 
         if accelerator.is_main_process:
-            throughput = graphs / wall if graphs and wall else 0.0
+            throughput = graphs / run_time if graphs and run_time else 0.0
             print(
                 f"Torch [{args.dtype}]: {graphs} graphs across {int(batches)} batches "
-                f"in {wall:.3f}s (wall, includes all prep/compute) => "
+                f"in {run_time:.3f}s => "
                 f"{throughput:.2f} graphs/s"
             )
             if args.csv_output is not None:
@@ -294,7 +290,7 @@ def main() -> None:
                         "device": args.device,
                         "graphs": int(graphs),
                         "batches": int(batches),
-                        "wall_time_s": wall,
+                        "run_time_s": run_time,
                         "throughput_graphs_per_s": throughput,
                         "compile_time_s": "",
                     },
