@@ -16,9 +16,10 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable
 
 import torch
+import torch.nn as nn
 
 from mace.calculators import foundations_models
 
@@ -110,7 +111,42 @@ def _wrap_with_cueq(
 
     device_str = device or "cpu"
     converted = convert_e3nn_to_cueq(model, device=device_str, return_model=True)
+    _propagate_cueq_config(converted)
     return converted
+
+
+def _propagate_cueq_config(model: torch.nn.Module) -> None:
+    """Expose cueq_config on the top-level model so downstream tools can detect it."""
+
+    if getattr(model, "cueq_config", None) is not None or getattr(
+        model, "cue_config", None
+    ) is not None:
+        return
+
+    def _iter_modules(candidate: object | None) -> Iterable[nn.Module]:
+        if candidate is None:
+            return []
+        if isinstance(candidate, (list, tuple)):
+            return candidate
+        if isinstance(candidate, nn.ModuleList):
+            return list(candidate)
+        return [candidate]
+
+    cue_cfg = None
+    for attr_name in ("node_embedding", "interactions", "readouts"):
+        modules = _iter_modules(getattr(model, attr_name, None))
+        for module in modules:
+            cue_cfg = getattr(module, "cueq_config", None) or getattr(
+                module, "cue_config", None
+            )
+            if cue_cfg is not None:
+                break
+        if cue_cfg is not None:
+            break
+
+    if cue_cfg is not None:
+        setattr(model, "cueq_config", cue_cfg)
+        setattr(model, "cue_config", cue_cfg)
 
 
 def _resolve_dtype(spec: str | None) -> torch.dtype | None:

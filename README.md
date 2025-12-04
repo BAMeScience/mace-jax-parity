@@ -9,6 +9,8 @@ scripts/
 ├─ benchmark_mace_jax.py          # JAX benchmark (compile time + throughput)
 ├─ convert_mace_model_to_jax.py   # torch → JAX bundle converter (pass --dtype to control casting)
 ├─ create_mace_foundation_model.py
+├─ check_cueq_torch.py            # report whether a Torch checkpoint uses cuEq kernels
+├─ check_cueq_jax.py              # inspect a JAX bundle for stored cuEq config
 ├─ plot_energy_diff.py            # CPU/GPU relative ΔE histograms (log scale)
 ```
 
