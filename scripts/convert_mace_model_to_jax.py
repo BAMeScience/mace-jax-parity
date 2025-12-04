@@ -66,6 +66,29 @@ def _sanitize(obj):
     return str(obj)
 
 
+_DTYPE_ALIASES = {
+    "float32": torch.float32,
+    "fp32": torch.float32,
+    "f32": torch.float32,
+    "float": torch.float32,
+    "float64": torch.float64,
+    "fp64": torch.float64,
+    "f64": torch.float64,
+    "double": torch.float64,
+}
+
+
+def _resolve_dtype(spec: str | None) -> torch.dtype | None:
+    if spec is None:
+        return None
+    key = spec.strip().lower()
+    if key not in _DTYPE_ALIASES:
+        raise ValueError(
+            f"Unsupported dtype '{spec}'. Expected one of: {', '.join(sorted(set(_DTYPE_ALIASES)))}"
+        )
+    return _DTYPE_ALIASES[key]
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Convert a Torch MACE model checkpoint to a MACE-JAX bundle."
@@ -81,6 +104,12 @@ def _parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("models/mace_jax_bundle"),
         help="Directory where the params/state/config artifacts will be written.",
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default=None,
+        help="Optional Torch dtype (e.g. float32, float64) to cast the model before conversion.",
     )
     return parser.parse_args()
 
@@ -101,9 +130,12 @@ def _format_irreps(value):
 
 def main() -> None:
     args = _parse_args()
+    target_dtype = _resolve_dtype(args.dtype)
 
     torch_model = torch.load(args.torch_model, map_location="cpu")
-    torch_model = torch_model.float().eval()
+    if target_dtype is not None:
+        torch_model = torch_model.to(dtype=target_dtype)
+    torch_model = torch_model.to("cpu").eval()
 
     config = extract_config_mace_model(torch_model)
     config["torch_model_class"] = torch_model.__class__.__name__

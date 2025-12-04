@@ -7,7 +7,7 @@ scripts/
 ├─ compare_mace_torch_jax.py      # parity check with progress bars and CSV logging
 ├─ benchmark_mace_torch.py        # Torch inference benchmark (Accelerate, CSV output)
 ├─ benchmark_mace_jax.py          # JAX benchmark (compile time + throughput)
-├─ convert_mace_model_to_jax.py   # torch → JAX bundle converter
+├─ convert_mace_model_to_jax.py   # torch → JAX bundle converter (pass --dtype to control casting)
 ├─ create_mace_foundation_model.py
 ├─ plot_energy_diff.py            # CPU/GPU relative ΔE histograms (log scale)
 ```
@@ -15,7 +15,9 @@ scripts/
 Other important directories:
 
 - `data/mptraj/` — contains `train.h5` / `valid.h5` subsets.
-- `models/` — generated artifacts (`mace_foundation.pt`, `mace_jax_bundle/`, caches).
+- `models/` — generated artifacts (dtype-specific Torch checkpoints and MACE-JAX bundles), e.g.
+  - `mace_foundation_f32.pt`, `mace_foundation_f64.pt`
+  - `mace_jax_bundle_f32/`, `mace_jax_bundle_f64/`
 - `results/` — CSVs and plots emitted by the Makefile targets.
 - `makefile` — orchestration for model creation, parity checks (float32/float64), benchmarks, and plotting.
 
@@ -26,8 +28,8 @@ Assumes the virtualenv at `/home/pbenner/Env/mace-jax/.venv` is activated.
 cd mace-jax-parity
 source ../.venv/bin/activate
 
-# Build Torch foundation model and JAX bundle.
-make models/mace_jax_bundle
+# Build Torch foundation models and JAX bundles (float32 + float64).
+make models/mace_jax_bundle_f32 models/mace_jax_bundle_f64
 
 # Run comparisons (float32 + float64) and produce plots.
 make compare
@@ -38,8 +40,8 @@ make benchmark
 
 # Direct script usage examples:
 python scripts/compare_mace_torch_jax.py \
-  --torch-model models/mace_foundation.pt \
-  --jax-model models/mace_jax_bundle \
+  --torch-model models/mace_foundation_f64.pt \
+  --jax-model models/mace_jax_bundle_f64 \
   --data-dir data/mptraj \
   --split valid \
   --dtype float64 \
@@ -48,8 +50,8 @@ python scripts/compare_mace_torch_jax.py \
   --tqdm
 
 python scripts/benchmark_mace_jax.py \
-  --torch-model models/mace_foundation.pt \
-  --jax-model models/mace_jax_bundle \
+  --torch-model models/mace_foundation_f32.pt \
+  --jax-model models/mace_jax_bundle_f32 \
   --data-dir data/mptraj \
   --split valid \
   --dtype float32 \

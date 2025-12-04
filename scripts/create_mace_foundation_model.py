@@ -38,6 +38,17 @@ FOUNDATION_LOADERS: dict[str, Callable] = {
     "omol": foundations_models.mace_omol,
 }
 
+_DTYPE_ALIASES = {
+    "float32": torch.float32,
+    "fp32": torch.float32,
+    "f32": torch.float32,
+    "single": torch.float32,
+    "float64": torch.float64,
+    "fp64": torch.float64,
+    "f64": torch.float64,
+    "double": torch.float64,
+}
+
 
 def _load_torch_model(
     family: str,
@@ -87,6 +98,17 @@ def _load_torch_model(
     )
 
 
+def _resolve_dtype(spec: str | None) -> torch.dtype | None:
+    if spec is None:
+        return None
+    key = spec.strip().lower()
+    if key not in _DTYPE_ALIASES:
+        raise ValueError(
+            f"Unsupported dtype '{spec}'. Expected one of: {', '.join(sorted(_DTYPE_ALIASES))}"
+        )
+    return _DTYPE_ALIASES[key]
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -125,6 +147,12 @@ def _parse_args() -> argparse.Namespace:
         help="Destination file for the serialized torch.nn.Module.",
     )
     parser.add_argument(
+        "--output-dtype",
+        type=str,
+        default=None,
+        help="Optional dtype (float32/float64) to cast the serialized Torch model to.",
+    )
+    parser.add_argument(
         "--enable-cueq",
         action="store_true",
         help="Ask the foundation loader to enable cuEquivariance acceleration.",
@@ -139,6 +167,7 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
+    target_dtype = _resolve_dtype(args.output_dtype)
 
     model = _load_torch_model(
         family=args.family,
@@ -148,8 +177,9 @@ def main() -> None:
         enable_cueq=bool(args.enable_cueq),
         only_cueq=bool(args.only_cueq),
     )
-    model = model.to("cpu")
-    model = model.float().eval()
+    if target_dtype is not None:
+        model = model.to(dtype=target_dtype)
+    model = model.to("cpu").eval()
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(model, args.output)

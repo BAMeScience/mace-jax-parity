@@ -17,8 +17,21 @@ import torch
 from accelerate import Accelerator
 from tqdm import tqdm
 
+from equitrain.backends.torch_utils import set_dtype as set_torch_default_dtype
 from equitrain.data.atomic import AtomicNumberTable
 from equitrain.data.backend_torch import get_dataloader as get_dataloader_torch
+def _cast_batch_dtype(batch, dtype):
+    if dtype is None:
+        return batch
+
+    def _convert(tensor):
+        if isinstance(tensor, torch.Tensor) and tensor.is_floating_point():
+            return tensor.to(dtype=dtype)
+        return tensor
+
+    if hasattr(batch, "apply"):
+        return batch.apply(_convert)
+    return _convert(batch)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -124,6 +137,8 @@ def _benchmark_torch(
     model,
     loaders: list[tuple[Path, object]],
     max_batches,
+    *,
+    dtype,
 ):
     model = accelerator.prepare(model)
 
@@ -149,6 +164,7 @@ def _benchmark_torch(
                     if max_batches is not None and local_batches >= max_batches:
                         break
                     batch = batch.to(device=accelerator.device)
+                    batch = _cast_batch_dtype(batch, dtype)
                     pred = model(
                         batch,
                         compute_force=False,
@@ -207,6 +223,7 @@ def _write_results_csv(path: Path, row: dict):
 
 def main() -> None:
     args = _parse_args()
+    set_torch_default_dtype(args.dtype)
     accelerator = Accelerator(split_batches=False)
 
     torch_dtype = getattr(torch, args.dtype, None)
@@ -271,6 +288,7 @@ def main() -> None:
             model,
             loaders,
             args.max_batches,
+            dtype=torch_dtype,
         )
 
         if accelerator.is_main_process:
