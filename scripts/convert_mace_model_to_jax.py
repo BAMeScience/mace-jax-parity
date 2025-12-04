@@ -128,6 +128,56 @@ def _format_irreps(value):
     return str(value)
 
 
+def _as_cue_config_dict(cue_cfg) -> dict | None:
+    if cue_cfg is None:
+        return None
+    if isinstance(cue_cfg, dict):
+        config = dict(cue_cfg)
+    else:
+        config = {}
+        for attr in (
+            "enabled",
+            "layout",
+            "layout_str",
+            "group",
+            "optimize_all",
+            "optimize_linear",
+            "optimize_channelwise",
+            "optimize_symmetric",
+            "optimize_fctp",
+            "conv_fusion",
+        ):
+            if hasattr(cue_cfg, attr):
+                config[attr] = getattr(cue_cfg, attr)
+
+    if not config:
+        return None
+
+    layout = config.get("layout_str") or config.get("layout") or "mul_ir"
+    layout_name = layout if isinstance(layout, str) else getattr(layout, "name", "mul_ir")
+    group_val = config.get("group", "O3")
+    if hasattr(group_val, "__name__"):
+        group_name = group_val.__name__.split(".")[-1]
+    elif isinstance(group_val, str):
+        group_name = group_val
+    else:
+        group_name = str(group_val)
+    if group_name.endswith("O3_e3nn") or group_name == "O3_e3nn":
+        group_name = "O3"
+
+    return {
+        "enabled": bool(config.get("enabled", False)),
+        "layout": layout_name,
+        "group": group_name,
+        "optimize_all": bool(config.get("optimize_all", False)),
+        "optimize_linear": bool(config.get("optimize_linear", False)),
+        "optimize_channelwise": bool(config.get("optimize_channelwise", False)),
+        "optimize_symmetric": bool(config.get("optimize_symmetric", False)),
+        "optimize_fctp": bool(config.get("optimize_fctp", False)),
+        "conv_fusion": bool(config.get("conv_fusion", False)),
+    }
+
+
 def main() -> None:
     args = _parse_args()
     target_dtype = _resolve_dtype(args.dtype)
@@ -138,6 +188,8 @@ def main() -> None:
     torch_model = torch_model.to("cpu").eval()
 
     config = extract_config_mace_model(torch_model)
+    cue_cfg = config.get("cueq_config") or getattr(torch_model, "cueq_config", None)
+    config["cueq_config"] = _as_cue_config_dict(cue_cfg)
     config["torch_model_class"] = torch_model.__class__.__name__
 
     # Ensure irreps are serialized in the textual form expected by mace-jax.
