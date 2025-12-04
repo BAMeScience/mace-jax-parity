@@ -75,27 +75,17 @@ def _load_torch_model(
     if only_cueq:
         loader_kwargs["only_cueq"] = True
 
-    if family == "mp":
+    if family == "anicc":
+        # ANIcc helper accepts ``model_path`` instead of ``model``.
+        return loader(
+            model_path=model,
+            **loader_kwargs,
+        )
+    else:
         return loader(
             model=model,
             **loader_kwargs,
         )
-    if family == "off":
-        return loader(
-            model=model,
-            **loader_kwargs,
-        )
-    if family == "omol":
-        return loader(
-            model=model,
-            **loader_kwargs,
-        )
-
-    # ANIcc helper accepts ``model_path`` instead of ``model``.
-    return loader(
-        model_path=model,
-        **loader_kwargs,
-    )
 
 
 def _resolve_dtype(spec: str | None) -> torch.dtype | None:

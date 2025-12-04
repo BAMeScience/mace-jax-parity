@@ -3,6 +3,9 @@ TORCH_F32 := models/mace_foundation_f32.pt
 TORCH_F64 := models/mace_foundation_f64.pt
 JAX_F32 := models/mace_jax_bundle_f32
 JAX_F64 := models/mace_jax_bundle_f64
+FOUNDATION_FAMILY := mp
+FOUNDATION_MODEL := medium-mpa-0
+FOUNDATION_NAME := $(FOUNDATION_FAMILY)_$(FOUNDATION_MODEL)
 
 all:
 	@echo "Available targets:"
@@ -46,8 +49,8 @@ benchmark-jax: $(JAX_F32)
 
 plot-comparison:
 	mkdir -p results
-	python scripts/plot_energy_diff.py --cpu-csv results/compare_cpu_f32.csv --gpu-csv results/compare_gpu_f32.csv --out results/energy_diff_f32.png --dtype float32
-	python scripts/plot_energy_diff.py --cpu-csv results/compare_cpu_f64.csv --gpu-csv results/compare_gpu_f64.csv --out results/energy_diff_f64.png --dtype float64
+	python scripts/plot_energy_diff.py --cpu-csv results/compare_cpu_f32.csv --gpu-csv results/compare_gpu_f32.csv --out results/energy_diff_f32.png --dtype float32 --model-name $(FOUNDATION_NAME)
+	python scripts/plot_energy_diff.py --cpu-csv results/compare_cpu_f64.csv --gpu-csv results/compare_gpu_f64.csv --out results/energy_diff_f64.png --dtype float64 --model-name $(FOUNDATION_NAME)
 
 ################################################################################
 
@@ -60,7 +63,7 @@ $(JAX_F64): $(TORCH_F64)
 	python scripts/convert_mace_model_to_jax.py --torch-model $< --output-dir $@ --dtype float64
 
 $(TORCH_F32):
-	python scripts/create_mace_foundation_model.py --output $@ --default-dtype float32 --output-dtype float32 --enable-cueq --only-cueq
+	python scripts/create_mace_foundation_model.py --output $@ --default-dtype float32 --output-dtype float32 --family $(FOUNDATION_FAMILY) --model $(FOUNDATION_MODEL) --enable-cueq --only-cueq
 
 $(TORCH_F64):
-	python scripts/create_mace_foundation_model.py --output $@ --default-dtype float64 --output-dtype float64 --enable-cueq --only-cueq
+	python scripts/create_mace_foundation_model.py --output $@ --default-dtype float64 --output-dtype float64 --family $(FOUNDATION_FAMILY) --model $(FOUNDATION_MODEL) --enable-cueq --only-cueq

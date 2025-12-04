@@ -57,6 +57,12 @@ def _parse_args() -> argparse.Namespace:
         default="float32",
         help="Annotate the plot with the dtype used for comparison (default: float32).",
     )
+    parser.add_argument(
+        "--model-name",
+        type=str,
+        default=None,
+        help="Optional foundation model identifier to annotate the figure title.",
+    )
     return parser.parse_args()
 
 
@@ -100,7 +106,11 @@ def main() -> None:
         ax.set_title(title)
         ax.grid(alpha=0.2, linestyle="--")
 
-    fig.suptitle(f"Relative energy differences (dtype={args.dtype})", fontsize=14)
+    model_note = f"{args.model_name}, " if args.model_name else ""
+    fig.suptitle(
+        f"Relative energy differences ({model_note}dtype={args.dtype})",
+        fontsize=14,
+    )
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     args.out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(args.out, dpi=150)
