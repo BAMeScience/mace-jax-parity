@@ -88,6 +88,31 @@ def _load_torch_model(
         )
 
 
+def _wrap_with_cueq(
+    model: torch.nn.Module,
+    *,
+    enable_cueq: bool,
+    only_cueq: bool,
+    device: str,
+) -> torch.nn.Module:
+    """Convert the raw Torch model to its cue-equivariant counterpart when requested."""
+
+    if not (enable_cueq or only_cueq):
+        return model
+
+    try:
+        from mace.cli.convert_e3nn_cueq import run as convert_e3nn_to_cueq
+    except ImportError as exc:  # pragma: no cover
+        raise ImportError(
+            "cuequivariance is required to enable cuEq acceleration. "
+            "Install the optional cue packages before passing --enable-cueq/--only-cueq."
+        ) from exc
+
+    device_str = device or "cpu"
+    converted = convert_e3nn_to_cueq(model, device=device_str, return_model=True)
+    return converted
+
+
 def _resolve_dtype(spec: str | None) -> torch.dtype | None:
     if spec is None:
         return None
@@ -166,6 +191,12 @@ def main() -> None:
         default_dtype=args.default_dtype,
         enable_cueq=bool(args.enable_cueq),
         only_cueq=bool(args.only_cueq),
+    )
+    model = _wrap_with_cueq(
+        model,
+        enable_cueq=bool(args.enable_cueq),
+        only_cueq=bool(args.only_cueq),
+        device=args.device,
     )
     if target_dtype is not None:
         model = model.to(dtype=target_dtype)
