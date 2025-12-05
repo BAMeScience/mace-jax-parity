@@ -7,6 +7,7 @@ scripts/
 ├─ compare_mace_torch_jax.py      # parity check with progress bars and CSV logging
 ├─ benchmark_mace_torch.py        # Torch inference benchmark (Accelerate, CSV output)
 ├─ benchmark_mace_jax.py          # JAX benchmark (compile time + throughput)
+├─ benchmark_mace_jax_train.py    # JAX training benchmark (one epoch w/ optax + CSV)
 ├─ convert_mace_model_to_jax.py   # torch → JAX bundle converter (pass --dtype to control casting)
 ├─ create_mace_foundation_model.py
 ├─ check_cueq_torch.py            # report whether a Torch checkpoint uses cuEq kernels
@@ -61,10 +62,21 @@ python scripts/benchmark_mace_jax.py \
   --multi-gpu \
   --max-edges-per-batch 480000 \
   --csv-output results/benchmark_jax.csv
+
+python scripts/benchmark_mace_jax_train.py \
+  --jax-model models/mace_jax_bundle_f32 \
+  --data-dir data/mptraj \
+  --split train \
+  --dtype float32 \
+  --batch-size 16 \
+  --learning-rate 1e-3 \
+  --multi-gpu \
+  --max-edges-per-batch 480000 \
+  --csv-output results/benchmark_jax_train.csv
 ```
 
 ## Notes
 - `make compare` now runs both float32 and float64 suites (`results/compare_*_f32.csv` / `_f64.csv`). Plotting creates separate figures per dtype.
 - `compare_mace_torch_jax.py` forces both Torch and JAX onto the same device (`--device`) and shows tqdm for each backend. CSV output includes absolute and relative ΔE for further analysis.
-- Benchmarks write machine-readable rows (backend, dtype, device, graphs/s, wall time, compile time). Torch uses Accelerate for multi-GPU, JAX reports XLA compile overhead.
+- Benchmarks write machine-readable rows (backend, dtype, device, graphs/s, wall time, compile time). Torch uses Accelerate for multi-GPU, JAX reports XLA compile overhead. The training benchmark shares the same CSV-friendly format and reports per-epoch losses.
 - `plot_energy_diff.py` consumes the CSVs and produces log-scale histograms of relative |ΔE|/scale for CPU vs GPU comparisons; pass `--dtype` to annotate the plots.
