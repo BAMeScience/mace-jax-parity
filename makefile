@@ -37,7 +37,7 @@ compare64-gpu: $(JAX_F64)
 
 ################################################################################
 
-benchmark: benchmark-torch benchmark-jax benchmark-jax-train
+benchmark: benchmark-torch benchmark-jax benchmark-jax-train benchmark-torch-train
 
 benchmark-torch: $(TORCH_F32)
 	mkdir -p results
@@ -50,6 +50,10 @@ benchmark-jax: $(JAX_F32)
 benchmark-jax-train: $(JAX_F32)
 	mkdir -p results
 	python scripts/benchmark_mace_jax_train.py --jax-model $(JAX_F32) --data-dir data/mptraj --split valid --dtype float32 --batch-size 16 --learning-rate 1e-3 --max-edges-per-batch 480000 --num-workers 24 --multi-gpu --tqdm --csv-output results/benchmark_jax_train.csv
+
+benchmark-torch-train: $(TORCH_F32)
+	mkdir -p results
+	accelerate launch scripts/benchmark_mace_torch_train.py --torch-model $(TORCH_F32) --data-dir data/mptraj --split valid --dtype float32 --batch-size 16 --learning-rate 1e-3 --max-edges-per-batch 480000 --num-workers 24 --tqdm --csv-output results/benchmark_torch_train.csv
 
 plot-comparison:
 	mkdir -p results
