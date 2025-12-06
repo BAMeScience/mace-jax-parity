@@ -5,8 +5,8 @@ Utilities to load or download a Torch MACE foundation model, convert it to a JAX
 ```
 scripts/
 ├─ compare_mace_torch_jax.py      # parity check with progress bars and CSV logging
-├─ benchmark_mace_torch.py        # Torch inference benchmark (Accelerate, CSV output)
-├─ benchmark_mace_jax.py          # JAX benchmark (compile time + throughput)
+├─ benchmark_mace_torch_predict.py # Torch inference benchmark (Accelerate, CSV output)
+├─ benchmark_mace_jax_predict.py   # JAX benchmark (compile time + throughput)
 ├─ benchmark_mace_jax_train.py    # JAX training benchmark (one epoch w/ optax + CSV)
 ├─ convert_mace_model_to_jax.py   # torch → JAX bundle converter (pass --dtype to control casting)
 ├─ create_mace_foundation_model.py
@@ -52,7 +52,7 @@ python scripts/compare_mace_torch_jax.py \
   --diff-csv results/custom_compare.csv \
   --tqdm
 
-python scripts/benchmark_mace_jax.py \
+python scripts/benchmark_mace_jax_predict.py \
   --torch-model models/mace_foundation_f32.pt \
   --jax-model models/mace_jax_bundle_f32 \
   --data-dir data/mptraj \

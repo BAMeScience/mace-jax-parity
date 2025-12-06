@@ -41,11 +41,11 @@ benchmark: benchmark-torch benchmark-jax benchmark-jax-train benchmark-torch-tra
 
 benchmark-torch: $(TORCH_F32)
 	mkdir -p results
-	accelerate launch scripts/benchmark_mace_torch.py --torch-model $(TORCH_F32) --data-dir data/mptraj --split valid --batch-size 18 --dtype float32 --device cuda --num-workers 8 --csv-output results/benchmark_torch.csv
+	accelerate launch scripts/benchmark_mace_torch_predict.py --torch-model $(TORCH_F32) --data-dir data/mptraj --split valid --batch-size 18 --dtype float32 --device cuda --num-workers 8 --csv-output results/benchmark_torch.csv
 
 benchmark-jax: $(JAX_F32)
 	mkdir -p results
-	python scripts/benchmark_mace_jax.py --torch-model $(TORCH_F32) --jax-model $(JAX_F32) --data-dir data/mptraj --split valid --dtype float32 --device cuda --max-edges-per-batch 480000 --max-nodes-per-batch 200000 --num-workers 24 --multi-gpu --csv-output results/benchmark_jax.csv
+	python scripts/benchmark_mace_jax_predict.py --torch-model $(TORCH_F32) --jax-model $(JAX_F32) --data-dir data/mptraj --split valid --dtype float32 --device cuda --max-edges-per-batch 480000 --max-nodes-per-batch 200000 --num-workers 24 --multi-gpu --csv-output results/benchmark_jax.csv
 
 benchmark-jax-train: $(JAX_F32)
 	mkdir -p results
