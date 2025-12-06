@@ -53,7 +53,7 @@ benchmark-jax-train: $(JAX_F32)
 
 benchmark-torch-train: $(TORCH_F32)
 	mkdir -p results
-	accelerate launch scripts/benchmark_mace_torch_train.py --torch-model $(TORCH_F32) --data-dir data/mptraj --split valid --dtype float32 --batch-size 16 --learning-rate 1e-3 --max-edges-per-batch 480000 --num-workers 24 --tqdm --csv-output results/benchmark_torch_train.csv
+	accelerate launch scripts/benchmark_mace_torch_train.py --torch-model $(TORCH_F32) --data-dir data/mptraj --split valid --dtype float32 --batch-size 80 --learning-rate 1e-3 --num-workers 24 --tqdm --csv-output results/benchmark_torch_train.csv
 
 plot-comparison:
 	mkdir -p results

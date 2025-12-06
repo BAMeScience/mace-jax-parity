@@ -321,11 +321,11 @@ def main() -> None:
         args.train_file,
         atomic_numbers,
         r_max,
-        accelerator=None,
+        accelerator=accelerator,
     )
     optimizer = create_optimizer(args, model)
 
-    model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
+    model, optimizer = accelerator.prepare(model, optimizer)
     counting_loader = _CountingLoader(train_loader)
 
     errors = None
@@ -365,7 +365,7 @@ def main() -> None:
 
         if accelerator.is_main_process:
             print(
-                f"Torch train benchmark: {total_graphs:.0f} graphs across {int(total_batches)} "
+                f"Torch train benchmark: {graphs:.0f} graphs across {int(total_batches)} "
                 f"batches in {total_time:.3f}s => {throughput:.2f} graphs/s"
             )
             _write_results_csv(
