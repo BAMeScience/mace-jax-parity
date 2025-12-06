@@ -267,15 +267,23 @@ def _benchmark_jax(
             f"[JAX] Dropping incomplete multi-device chunk ({count}/{expected})."
         )
 
-    remainder_iter = batched_iterator(
-        micro_iter,
-        group_size,
-        remainder_action=_warn_incomplete if use_pmap else None,
-    )
-    chunk_iter = (
-        itertools.chain([first_chunk], remainder_iter)
-        if first_chunk
-        else remainder_iter
+    leftover_micro_batches: list[jraph.GraphsTuple] = []
+
+    def _chunk_generator():
+        while True:
+            chunk = take_chunk(micro_iter, group_size)
+            if not chunk:
+                break
+            if use_pmap and len(chunk) < group_size:
+                _warn_incomplete(len(chunk), group_size)
+                leftover_micro_batches.extend([g for g in chunk if g is not None])
+                break
+            yield [g for g in chunk if g is not None]
+        return
+
+    chunk_iter = itertools.chain(
+        [first_chunk] if first_chunk else [],
+        _chunk_generator(),
     )
 
     def _prepare_chunk(graphs_chunk: list[jraph.GraphsTuple]):
@@ -310,6 +318,7 @@ def _benchmark_jax(
 
         graphs = chunk if isinstance(chunk, list) else [chunk]
         real_graphs = sum(_count_real_graphs(graph) for graph in graphs)
+
         rep_graph = graphs[0]
         signature = (
             int(rep_graph.n_node.shape[0]),
@@ -336,6 +345,22 @@ def _benchmark_jax(
 
         total_graphs += real_graphs
         batches_seen += 1
+
+    if leftovers := [g for g in leftover_micro_batches if g is not None]:
+        tqdm.write(
+            "[JAX] Processing remaining micro-batches on a single device to avoid drops."
+        )
+        for graph in leftovers:
+            real = _count_real_graphs(graph)
+            if real == 0:
+                continue
+            single = _prepare_single_batch(graph)
+            pred = jit_apply(bundle.params, single)
+            energy = pred["energy"]
+            if hasattr(energy, "block_until_ready"):
+                energy.block_until_ready()
+            total_graphs += real
+            batches_seen += 1
 
     run_time = time.perf_counter() - run_start
 

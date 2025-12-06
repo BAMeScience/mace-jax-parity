@@ -74,6 +74,18 @@ def _parse_args() -> argparse.Namespace:
         help="Batch size fed into the equitrain predict routines (default: 4).",
     )
     parser.add_argument(
+        "--max-nodes-per-batch",
+        type=int,
+        default=200000,
+        help="JAX/Torch greedy packer node cap per macro-batch.",
+    )
+    parser.add_argument(
+        "--max-edges-per-batch",
+        type=int,
+        default=480000,
+        help="JAX/Torch greedy packer edge cap per macro-batch.",
+    )
+    parser.add_argument(
         "--energy-tol",
         type=float,
         default=1e-5,
@@ -130,6 +142,8 @@ def _make_predict_args(base_args, backend: str, model_path: Path, predict_file: 
         predict_args.batch_drop = False
     if not hasattr(predict_args, "niggli_reduce"):
         predict_args.niggli_reduce = False
+    predict_args.batch_max_nodes = getattr(base_args, "max_nodes_per_batch", None)
+    predict_args.batch_max_edges = getattr(base_args, "max_edges_per_batch", None)
     return predict_args
 
 

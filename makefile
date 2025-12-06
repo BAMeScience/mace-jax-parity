@@ -29,11 +29,11 @@ compare32-gpu: $(JAX_F32)
 
 compare64-cpu: $(JAX_F64)
 	mkdir -p results
-	python scripts/compare_mace_torch_jax.py --torch-model $(TORCH_F64) --jax-model $(JAX_F64) --data-dir data/mptraj --dtype float64 --split valid --device cpu --diff-csv results/compare_cpu_f64.csv
+	python scripts/compare_mace_torch_jax.py --torch-model $(TORCH_F64) --jax-model $(JAX_F64) --data-dir data/mptraj --dtype float64 --split valid --device cpu --max-edges-per-batch 240000 --max-nodes-per-batch 200000 --diff-csv results/compare_cpu_f64.csv
 
 compare64-gpu: $(JAX_F64)
 	mkdir -p results
-	python scripts/compare_mace_torch_jax.py --torch-model $(TORCH_F64) --jax-model $(JAX_F64) --data-dir data/mptraj --dtype float64 --split valid --device cuda --diff-csv results/compare_gpu_f64.csv
+	python scripts/compare_mace_torch_jax.py --torch-model $(TORCH_F64) --jax-model $(JAX_F64) --data-dir data/mptraj --dtype float64 --split valid --device cuda --max-edges-per-batch 240000 --max-nodes-per-batch 200000 --diff-csv results/compare_gpu_f64.csv
 
 ################################################################################
 
@@ -45,11 +45,11 @@ benchmark-torch-predict: $(TORCH_F32)
 
 benchmark-jax-predict: $(JAX_F32)
 	mkdir -p results
-	python scripts/benchmark_mace_jax_predict.py --torch-model $(TORCH_F32) --jax-model $(JAX_F32) --data-dir data/mptraj --split valid --dtype float32 --device cuda --max-edges-per-batch 480000 --max-nodes-per-batch 200000 --num-workers 24 --multi-gpu --csv-output results/benchmark_jax.csv
+	python scripts/benchmark_mace_jax_predict.py --torch-model $(TORCH_F32) --jax-model $(JAX_F32) --data-dir data/mptraj --split valid --dtype float32 --device cuda --max-edges-per-batch 480000 --num-workers 24 --multi-gpu --csv-output results/benchmark_jax.csv
 
 benchmark-jax-train: $(JAX_F32)
 	mkdir -p results
-	python scripts/benchmark_mace_jax_train.py --jax-model $(JAX_F32) --data-dir data/mptraj --split valid --dtype float32 --learning-rate 1e-3 --max-edges-per-batch 280000 --num-workers 24 --multi-gpu --tqdm --csv-output results/benchmark_jax_train.csv
+	python scripts/benchmark_mace_jax_train.py --jax-model $(JAX_F32) --data-dir data/mptraj --split valid --dtype float32 --learning-rate 1e-3 --max-edges-per-batch 280000 --prefetch-batches 24 --multi-gpu --tqdm --csv-output results/benchmark_jax_train.csv
 
 benchmark-torch-train: $(TORCH_F32)
 	mkdir -p results
