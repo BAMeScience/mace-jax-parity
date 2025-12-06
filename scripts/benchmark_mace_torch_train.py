@@ -23,6 +23,7 @@ if callable(_torch_add_safe_globals):  # pragma: no cover
 from equitrain.argparser import get_args_parser_train, get_loss_monitor
 from equitrain.backends.torch_backend import train_one_epoch
 from equitrain.backends.torch_optimizer import create_optimizer
+from equitrain.backends.torch_wrappers.mace import MaceWrapper as TorchMaceWrapper
 from equitrain.backends.torch_utils import set_dtype as set_torch_default_dtype
 from equitrain.backends.torch_utils import set_seeds
 from equitrain.data.atomic import AtomicNumberTable
@@ -41,11 +42,10 @@ class _BenchmarkLogger:
 
 
 class _CountingLoader:
-    """Wrap a DataLoader to record processed graphs and batches."""
+    """Thin wrapper that counts how many macro-batches were yielded."""
 
     def __init__(self, loader):
         self._loader = loader
-        self.graphs = 0
         self.batches = 0
 
     def __len__(self):
@@ -54,29 +54,9 @@ class _CountingLoader:
     def __getattr__(self, name):
         return getattr(self._loader, name)
 
-    def _count_graphs(self, batch) -> int:
-        if batch is None:
-            return 0
-        if hasattr(batch, "num_graphs"):
-            return int(batch.num_graphs)
-        if hasattr(batch, "ptr"):
-            ptr = getattr(batch, "ptr")
-            if isinstance(ptr, torch.Tensor):
-                return int(ptr.shape[0] - 1)
-        if hasattr(batch, "y"):
-            target = getattr(batch, "y")
-            if isinstance(target, torch.Tensor):
-                return int(target.shape[0])
-        return 0
-
     def __iter__(self):
         for item in self._loader:
             self.batches += 1
-            if isinstance(item, list):
-                for sub in item:
-                    self.graphs += self._count_graphs(sub)
-            else:
-                self.graphs += self._count_graphs(item)
             yield item
 
 
@@ -219,6 +199,9 @@ def _finalize_args(args: argparse.Namespace) -> argparse.Namespace:
             args.train_max_steps = args.max_batches
         else:
             args.train_max_steps = min(int(args.train_max_steps), int(args.max_batches))
+    # mp-traj benchmarks do not provide consistent forces/stress labels; disable by default.
+    args.forces_weight = 0.0
+    args.stress_weight = 0.0
     return args
 
 
@@ -328,6 +311,7 @@ def main() -> None:
         weights_only=False,
     )
     model = model.to(dtype=torch_dtype)
+    model = TorchMaceWrapper(args, model)
 
     atomic_numbers = _resolve_atomic_numbers(model)
     r_max = _resolve_r_max(model)
@@ -363,24 +347,20 @@ def main() -> None:
 
         accelerator.wait_for_everyone()
 
-        local_graphs = torch.tensor(
-            float(counting_loader.graphs),
-            device=accelerator.device,
-            dtype=torch.float64,
-        )
+        graphs = float(train_metrics.main["total"].count)
+
         local_batches = torch.tensor(
             float(counting_loader.batches),
             device=accelerator.device,
             dtype=torch.float64,
         )
-        total_graphs = accelerator.reduce(local_graphs, reduction="sum").item()
         total_batches = accelerator.reduce(local_batches, reduction="sum").item()
 
         run_time_tensor = torch.tensor(
             float(run_time), device=accelerator.device, dtype=torch.float64
         )
         total_time = accelerator.reduce(run_time_tensor, reduction="max").item()
-        throughput = total_graphs / total_time if total_graphs and total_time else 0.0
+        throughput = graphs / total_time if graphs and total_time else 0.0
         mean_loss = float(train_metrics.main["total"].avg)
 
         if accelerator.is_main_process:
@@ -397,7 +377,7 @@ def main() -> None:
                     "dtype": args.dtype,
                     "optimizer": args.opt,
                     "learning_rate": args.lr,
-                    "graphs": total_graphs,
+                    "graphs": graphs,
                     "batches": total_batches,
                     "run_time_s": total_time,
                     "throughput_graphs_per_s": throughput,
