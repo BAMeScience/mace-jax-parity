@@ -419,7 +419,6 @@ def main() -> None:
         data_file=h5_files,
         atomic_numbers=z_table,
         r_max=r_max,
-        batch_size=None,
         shuffle=False,
         max_nodes=args.max_nodes_per_batch,
         max_edges=args.max_edges_per_batch,

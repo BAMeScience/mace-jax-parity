@@ -247,8 +247,7 @@ def _write_results_csv(path: Path | None, row: dict) -> None:
 def main() -> None:
     parser = _augment_train_parser(get_args_parser_train())
     args = _finalize_args(parser.parse_args())
-    if args.batch_size <= 0:
-        raise ValueError("--batch-size must be a positive integer.")
+    args.batch_size = None
 
     _setup_jax(args.dtype)
     bundle = load_model_bundle(str(args.model), dtype=args.dtype)
@@ -277,7 +276,6 @@ def main() -> None:
         data_file=[str(p) for p in train_files],
         atomic_numbers=z_table,
         r_max=r_max,
-        batch_size=args.batch_size,
         shuffle=bool(args.shuffle),
         max_nodes=args.batch_max_nodes,
         max_edges=args.batch_max_edges,
