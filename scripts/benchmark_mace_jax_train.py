@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import time
+import itertools
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -31,6 +32,8 @@ from equitrain.backends.jax_loss_fn import LossSettings, build_loss_fn
 from equitrain.backends.jax_optimizer import create_optimizer
 from equitrain.backends.jax_utils import (
     load_model_bundle,
+    prepare_sharded_batch as _prepare_sharded_batch,
+    prepare_single_batch as _prepare_single_batch,
     supports_multiprocessing_workers,
 )
 from equitrain.backends.jax_wrappers import MaceWrapper as JaxMaceWrapper
@@ -42,27 +45,100 @@ from equitrain.data.backend_jax import make_apply_fn
 class _CountingLoader:
     """Thin wrapper to record how many macro-batches were consumed."""
 
-    def __init__(self, loader):
-        self._loader = loader
+    def __init__(self, iterator, *, delegate):
+        self._iterator = iterator
+        self._delegate = delegate
         self.batches = 0
         self._len_cache = None
 
     def __iter__(self):
-        for item in self._loader:
+        for item in self._iterator:
             self.batches += 1
             yield item
 
     def __len__(self):
         if self._len_cache is None:
-            self._len_cache = len(self._loader)
+            self._len_cache = len(self._delegate)
         return self._len_cache
 
     def pack_info(self):
-        return self._loader.pack_info()
+        return self._delegate.pack_info()
 
     def __getattr__(self, name):
-        return getattr(self._loader, name)
+        return getattr(self._delegate, name)
 
+
+def _block_until_ready(tree):
+    def _wait(x):
+        if hasattr(x, "block_until_ready"):
+            return x.block_until_ready()
+        return x
+
+    jax.tree_util.tree_map(_wait, tree)
+
+
+def _iter_micro_from_batch(batch):
+    if batch is None:
+        return
+    if isinstance(batch, list):
+        for item in batch:
+            if item is not None:
+                yield item
+    else:
+        yield batch
+
+
+def _prime_loader_for_warmup(loader, *, multi_device: bool, device_count: int):
+    iterator = iter(loader)
+    consumed = []
+    micro_samples = []
+    need = device_count if multi_device and device_count > 1 else 1
+    while True:
+        try:
+            batch = next(iterator)
+        except StopIteration:
+            break
+        consumed.append(batch)
+        for micro in _iter_micro_from_batch(batch):
+            micro_samples.append(micro)
+            if len(micro_samples) >= need:
+                break
+        if len(micro_samples) >= need:
+            break
+    combined_iter = itertools.chain(consumed, iterator)
+    if multi_device and device_count > 1:
+        sample = (
+            ("multi", micro_samples[:device_count])
+            if len(micro_samples) >= device_count
+            else None
+        )
+    else:
+        sample = ("single", micro_samples[0]) if micro_samples else None
+    return sample, combined_iter
+
+
+def _measure_compile_time(
+    state,
+    grad_step_fn,
+    apply_updates_fn,
+    sample,
+    *,
+    multi_device: bool,
+    device_count: int,
+):
+    if sample is None:
+        return 0.0
+    mode, payload = sample
+    if mode == "multi":
+        batch = _prepare_sharded_batch(payload, device_count)
+    else:
+        batch = _prepare_single_batch(payload)
+    start = time.perf_counter()
+    loss, aux, grads = grad_step_fn(state.params, batch)
+    _block_until_ready((loss, aux, grads))
+    new_state = apply_updates_fn(state, grads, 0.0)
+    _block_until_ready(new_state)
+    return time.perf_counter() - start
 
 def _augment_train_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.set_defaults(tqdm=True)
@@ -287,7 +363,12 @@ def main() -> None:
         num_workers=effective_workers,
         graph_multiple=device_multiplier if multi_device else 1,
     )
-    train_loader = _CountingLoader(raw_loader)
+    warmup_sample, primed_iter = _prime_loader_for_warmup(
+        raw_loader,
+        multi_device=multi_device,
+        device_count=device_multiplier if multi_device else 1,
+    )
+    train_loader = _CountingLoader(primed_iter, delegate=raw_loader)
 
     wrapper = JaxMaceWrapper(
         module=bundle.module,
@@ -327,6 +408,20 @@ def main() -> None:
             if isinstance(result, tuple) and len(result) == 1:
                 return result[0]
             return result
+
+    compile_time = _measure_compile_time(
+        state,
+        grad_step_fn,
+        apply_updates_fn,
+        warmup_sample,
+        multi_device=multi_device,
+        device_count=device_multiplier if multi_device else 1,
+    )
+    # Reset optimizer state after warmup so benchmarking starts from fresh weights.
+    opt_state = optimizer.init(bundle.params)
+    state = TrainState(params=bundle.params, opt_state=opt_state, ema_params=None)
+    if multi_device:
+        state = _replicate_state(state)
 
     metric_settings = dict(
         include_energy=loss_settings.energy_weight > 0.0,
@@ -375,7 +470,8 @@ def main() -> None:
         print(f"[train] Dropped {dropped} graphs due to edge/node limits.")
 
     print(
-        f"Train benchmark: {graphs:.0f} graphs across {batches} batches in {run_time:.3f}s => {throughput:.2f} graphs/s"
+        f"Train benchmark: {graphs:.0f} graphs across {batches} batches in {run_time:.3f}s "
+        f"(compile {compile_time:.3f}s) => {throughput:.2f} graphs/s"
     )
 
     _write_results_csv(
@@ -391,7 +487,7 @@ def main() -> None:
             "batches": batches,
             "run_time_s": run_time,
             "throughput_graphs_per_s": throughput,
-            "compile_time_s": "",
+            "compile_time_s": compile_time,
             "mean_loss": mean_loss,
         },
     )
