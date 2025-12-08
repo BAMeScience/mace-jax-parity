@@ -18,11 +18,7 @@ import jax
 import jraph
 import numpy as np
 import torch
-from torch.serialization import add_safe_globals
-from tqdm import tqdm
-
 from equitrain.backends.jax_utils import (
-    batched_iterator,
     iter_micro_batches,
     load_model_bundle,
     replicate_to_local_devices,
@@ -43,6 +39,8 @@ from equitrain.data.backend_jax import (
 from equitrain.data.backend_jax import (
     make_apply_fn,
 )
+from torch.serialization import add_safe_globals
+from tqdm import tqdm
 
 add_safe_globals([slice])
 

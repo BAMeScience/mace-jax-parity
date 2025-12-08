@@ -5,8 +5,8 @@ from __future__ import annotations
 
 import argparse
 import csv
-import time
 import itertools
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -32,9 +32,13 @@ from equitrain.backends.jax_loss_fn import LossSettings, build_loss_fn
 from equitrain.backends.jax_optimizer import create_optimizer
 from equitrain.backends.jax_utils import (
     load_model_bundle,
-    prepare_sharded_batch as _prepare_sharded_batch,
-    prepare_single_batch as _prepare_single_batch,
     supports_multiprocessing_workers,
+)
+from equitrain.backends.jax_utils import (
+    prepare_sharded_batch as _prepare_sharded_batch,
+)
+from equitrain.backends.jax_utils import (
+    prepare_single_batch as _prepare_single_batch,
 )
 from equitrain.backends.jax_wrappers import MaceWrapper as JaxMaceWrapper
 from equitrain.data.atomic import AtomicNumberTable
@@ -140,6 +144,7 @@ def _measure_compile_time(
     _block_until_ready(new_state)
     return time.perf_counter() - start
 
+
 def _augment_train_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.set_defaults(tqdm=True)
     parser.add_argument(
@@ -242,6 +247,9 @@ def _finalize_args(args: argparse.Namespace) -> argparse.Namespace:
     if isinstance(args.model, Path):
         args.model = str(args.model)
     args.data_dir = Path(getattr(args, "data_dir", Path("data/mptraj")))
+    # mp-traj benchmarks do not provide consistent forces/stress labels; disable by default.
+    args.forces_weight = 0.0
+    args.stress_weight = 0.0
     return args
 
 
