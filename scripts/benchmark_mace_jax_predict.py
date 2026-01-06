@@ -398,13 +398,10 @@ def _load_torch_model(args, device: torch.device, torch_dtype):
     return model
 
 
-def _list_h5_files(args) -> list[Path]:
-    files = sorted(args.data_dir.glob("*.h5"))
-    if args.split != "all":
-        files = [p for p in files if p.stem == args.split]
-    if not files:
-        raise FileNotFoundError(f"No HDF5 files found under {args.data_dir}")
-    return files
+def _resolve_data_file(data_dir: Path, split: str) -> Path:
+    if split == "all":
+        return data_dir
+    return data_dir / f"{split}.h5"
 
 
 def main() -> None:
@@ -423,7 +420,7 @@ def main() -> None:
     atomic_numbers = _extract_atomic_numbers(torch_model, bundle)
     r_max = _extract_r_max(torch_model, bundle)
     z_table = AtomicNumberTable(atomic_numbers)
-    h5_files = _list_h5_files(args)
+    h5_files = _resolve_data_file(args.data_dir, args.split)
 
     prep_start = time.perf_counter()
     device_multiplier = jax.local_device_count() if args.multi_gpu else 1

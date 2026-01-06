@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Convert a serialized Torch MACE model into a bundle that can be consumed by
-``mace-jax``.  The script mirrors the logic in mace_jax.cli.mace_torch2jax and
+``mace-jax``.  The script mirrors the logic in mace_jax.cli.mace_jax_from_torch and
 produces a parameter/state msgpack pair together with the sanitized model
 configuration.
 
@@ -39,7 +39,7 @@ except ImportError:  # pragma: no cover
     TorchIrreps = None
 
 from flax import serialization
-from mace_jax.cli import mace_torch2jax
+from mace_jax.cli import mace_jax_from_torch
 
 from mace.tools.scripts_utils import extract_config_mace_model
 
@@ -197,7 +197,7 @@ def main() -> None:
         if "irreps" in key.lower():
             config[key] = _format_irreps(value)
 
-    jax_model, jax_params, _template = mace_torch2jax.convert_model(torch_model, config)
+    jax_model, jax_params, _template = mace_jax_from_torch.convert_model(torch_model, config)
 
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)

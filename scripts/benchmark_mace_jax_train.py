@@ -66,7 +66,10 @@ class _CountingLoader:
         return self._len_cache
 
     def pack_info(self):
-        return self._delegate.pack_info()
+        pack_info = getattr(self._delegate, "pack_info", None)
+        if callable(pack_info):
+            return pack_info()
+        return {}
 
     def __getattr__(self, name):
         return getattr(self._delegate, name)
@@ -264,15 +267,10 @@ def _setup_jax(dtype: str):
         pass
 
 
-def _list_h5_files(data_dir: Path, split: str) -> list[Path]:
-    files = sorted(data_dir.glob("*.h5"))
-    if split != "all":
-        files = [p for p in files if p.stem == split]
-    if not files:
-        raise FileNotFoundError(
-            f"No HDF5 files found under {data_dir} for split '{split}'"
-        )
-    return files
+def _resolve_data_file(data_dir: Path, split: str) -> Path:
+    if split == "all":
+        return data_dir
+    return data_dir / f"{split}.h5"
 
 
 def _resolve_float(value, default: float) -> float:
@@ -343,7 +341,7 @@ def main() -> None:
     if r_max <= 0.0:
         raise RuntimeError("Model configuration must define a positive `r_max`.")
 
-    train_files = _list_h5_files(args.data_dir, args.split)
+    train_files = _resolve_data_file(args.data_dir, args.split)
     device_multiplier = jax.local_device_count()
     multi_device = args.multi_gpu and device_multiplier > 1
     base_workers = max(int(args.num_workers or 0), 0)
@@ -357,7 +355,7 @@ def main() -> None:
         prefetch_batches = max(int(args.prefetch_batches or 0), 0)
 
     raw_loader = get_dataloader_jax(
-        data_file=[str(p) for p in train_files],
+        data_file=train_files,
         atomic_numbers=z_table,
         r_max=r_max,
         shuffle=bool(args.shuffle),
