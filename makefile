@@ -30,17 +30,17 @@ compare64: compare64-cpu compare64-gpu
 compare32-nocueq: compare32-nocueq-gpu
 compare64-nocueq: compare64-nocueq-gpu
 
-compare32-cpu: $(JAX_F32)
+compare32-cpu: $(JAX_F32_NO_CUEQ)
 	mkdir -p results
-	python scripts/compare_mace_torch_jax.py --torch-model $(TORCH_F32) --jax-model $(JAX_F32) --data-dir data/mptraj --dtype float32 --split valid --device cpu --max-edges-per-batch 10000 --num-workers $(NUM_WORKERS) --diff-csv results/compare_cpu_f32.csv
+	python scripts/compare_mace_torch_jax.py --torch-model $(TORCH_F32_NO_CUEQ) --jax-model $(JAX_F32_NO_CUEQ) --data-dir data/mptraj --dtype float32 --split valid --device cpu --max-edges-per-batch 10000 --num-workers $(NUM_WORKERS) --diff-csv results/compare_cpu_f32.csv
 
 compare32-gpu: $(JAX_F32)
 	mkdir -p results
 	python scripts/compare_mace_torch_jax.py --torch-model $(TORCH_F32) --jax-model $(JAX_F32) --data-dir data/mptraj --dtype float32 --split valid --device cuda --max-edges-per-batch 10000 --num-workers $(NUM_WORKERS) --diff-csv results/compare_gpu_f32.csv
 
-compare64-cpu: $(JAX_F64)
+compare64-cpu: $(JAX_F64_NO_CUEQ)
 	mkdir -p results
-	python scripts/compare_mace_torch_jax.py --torch-model $(TORCH_F64) --jax-model $(JAX_F64) --data-dir data/mptraj --dtype float64 --split valid --device cpu --max-edges-per-batch 10000 --num-workers $(NUM_WORKERS) --diff-csv results/compare_cpu_f64.csv
+	python scripts/compare_mace_torch_jax.py --torch-model $(TORCH_F64_NO_CUEQ) --jax-model $(JAX_F64_NO_CUEQ) --data-dir data/mptraj --dtype float64 --split valid --device cpu --max-edges-per-batch 10000 --num-workers $(NUM_WORKERS) --diff-csv results/compare_cpu_f64.csv
 
 compare64-gpu: $(JAX_F64)
 	mkdir -p results
