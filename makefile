@@ -1,39 +1,66 @@
 
 TORCH_F32 := models/mace_foundation_f32.pt
 TORCH_F64 := models/mace_foundation_f64.pt
+TORCH_F32_NO_CUEQ := models/mace_foundation_f32_nocueq.pt
+TORCH_F64_NO_CUEQ := models/mace_foundation_f64_nocueq.pt
 JAX_F32 := models/mace_jax_bundle_f32
 JAX_F64 := models/mace_jax_bundle_f64
+JAX_F32_NO_CUEQ := models/mace_jax_bundle_f32_nocueq
+JAX_F64_NO_CUEQ := models/mace_jax_bundle_f64_nocueq
 FOUNDATION_FAMILY := mp
 FOUNDATION_MODEL := medium-mpa-0
 FOUNDATION_NAME := $(FOUNDATION_FAMILY)_$(FOUNDATION_MODEL)
-
-all:
-	@echo "Available targets:"
-	@echo "  compare   - Compare MACE JAX model with MACE Torch model"
-	@echo "  benchmark - Benchmark MACE JAX model against MACE Torch model"
-	@echo "  plot      - Plot CPU/GPU energy difference histograms"
+NUM_WORKERS := 20
 
 ################################################################################
 
-compare: compare32 compare64
+all:
+	@echo "Available targets:"
+	@echo "  compare        - Compare MACE JAX model with MACE Torch model"
+	@echo "  compare-nocueq - Compare without cuEq flags"
+	@echo "  benchmark      - Benchmark MACE JAX model against MACE Torch model"
+	@echo "  plot           - Plot CPU/GPU energy difference histograms"
+
+################################################################################
+
+compare: compare32 compare64 compare32-nocueq compare64-nocueq
+compare-nocueq: compare32-nocueq compare64-nocueq
 compare32: compare32-cpu compare32-gpu
 compare64: compare64-cpu compare64-gpu
+compare32-nocueq: compare32-nocueq-cpu compare32-nocueq-gpu
+compare64-nocueq: compare64-nocueq-cpu compare64-nocueq-gpu
 
 compare32-cpu: $(JAX_F32)
 	mkdir -p results
-	python scripts/compare_mace_torch_jax.py --torch-model $(TORCH_F32) --jax-model $(JAX_F32) --data-dir data/mptraj --dtype float32 --split valid --device cpu --num-workers 5 --diff-csv results/compare_cpu_f32.csv
+	python scripts/compare_mace_torch_jax.py --torch-model $(TORCH_F32) --jax-model $(JAX_F32) --data-dir data/mptraj --dtype float32 --split valid --device cpu --max-edges-per-batch 10000 --num-workers $(NUM_WORKERS) --diff-csv results/compare_cpu_f32.csv
 
 compare32-gpu: $(JAX_F32)
 	mkdir -p results
-	python scripts/compare_mace_torch_jax.py --torch-model $(TORCH_F32) --jax-model $(JAX_F32) --data-dir data/mptraj --dtype float32 --split valid --device cuda --num-workers 5 --diff-csv results/compare_gpu_f32.csv
+	python scripts/compare_mace_torch_jax.py --torch-model $(TORCH_F32) --jax-model $(JAX_F32) --data-dir data/mptraj --dtype float32 --split valid --device cuda --max-edges-per-batch 10000 --num-workers $(NUM_WORKERS) --diff-csv results/compare_gpu_f32.csv
 
 compare64-cpu: $(JAX_F64)
 	mkdir -p results
-	python scripts/compare_mace_torch_jax.py --torch-model $(TORCH_F64) --jax-model $(JAX_F64) --data-dir data/mptraj --dtype float64 --split valid --device cpu --max-edges-per-batch 240000 --max-nodes-per-batch 100000 --num-workers 5 --diff-csv results/compare_cpu_f64.csv
+	python scripts/compare_mace_torch_jax.py --torch-model $(TORCH_F64) --jax-model $(JAX_F64) --data-dir data/mptraj --dtype float64 --split valid --device cpu --max-edges-per-batch 10000 --num-workers $(NUM_WORKERS) --diff-csv results/compare_cpu_f64.csv
 
 compare64-gpu: $(JAX_F64)
 	mkdir -p results
-	python scripts/compare_mace_torch_jax.py --torch-model $(TORCH_F64) --jax-model $(JAX_F64) --data-dir data/mptraj --dtype float64 --split valid --device cuda --max-edges-per-batch 240000 --max-nodes-per-batch 100000 --num-workers 5 --diff-csv results/compare_gpu_f64.csv
+	python scripts/compare_mace_torch_jax.py --torch-model $(TORCH_F64) --jax-model $(JAX_F64) --data-dir data/mptraj --dtype float64 --split valid --device cuda --max-edges-per-batch 10000 --num-workers $(NUM_WORKERS) --diff-csv results/compare_gpu_f64.csv
+
+compare32-nocueq-cpu: $(JAX_F32_NO_CUEQ)
+	mkdir -p results
+	python scripts/compare_mace_torch_jax.py --torch-model $(TORCH_F32_NO_CUEQ) --jax-model $(JAX_F32_NO_CUEQ) --data-dir data/mptraj --dtype float32 --split valid --device cpu --max-edges-per-batch 10000 --num-workers $(NUM_WORKERS) --diff-csv results/compare_cpu_f32_nocueq.csv
+
+compare32-nocueq-gpu: $(JAX_F32_NO_CUEQ)
+	mkdir -p results
+	python scripts/compare_mace_torch_jax.py --torch-model $(TORCH_F32_NO_CUEQ) --jax-model $(JAX_F32_NO_CUEQ) --data-dir data/mptraj --dtype float32 --split valid --device cuda --max-edges-per-batch 10000 --num-workers $(NUM_WORKERS) --diff-csv results/compare_gpu_f32_nocueq.csv
+
+compare64-nocueq-cpu: $(JAX_F64_NO_CUEQ)
+	mkdir -p results
+	python scripts/compare_mace_torch_jax.py --torch-model $(TORCH_F64_NO_CUEQ) --jax-model $(JAX_F64_NO_CUEQ) --data-dir data/mptraj --dtype float64 --split valid --device cpu --max-edges-per-batch 10000 --num-workers $(NUM_WORKERS) --diff-csv results/compare_cpu_f64_nocueq.csv
+
+compare64-nocueq-gpu: $(JAX_F64_NO_CUEQ)
+	mkdir -p results
+	python scripts/compare_mace_torch_jax.py --torch-model $(TORCH_F64_NO_CUEQ) --jax-model $(JAX_F64_NO_CUEQ) --data-dir data/mptraj --dtype float64 --split valid --device cuda --max-edges-per-batch 10000 --num-workers $(NUM_WORKERS) --diff-csv results/compare_gpu_f64_nocueq.csv
 
 ################################################################################
 
@@ -70,8 +97,22 @@ $(JAX_F64): $(TORCH_F64)
 	rm -rf $@
 	python scripts/convert_mace_model_to_jax.py --torch-model $< --output-dir $@ --dtype float64
 
+$(JAX_F32_NO_CUEQ): $(TORCH_F32_NO_CUEQ)
+	rm -rf $@
+	python scripts/convert_mace_model_to_jax.py --torch-model $< --output-dir $@ --dtype float32
+
+$(JAX_F64_NO_CUEQ): $(TORCH_F64_NO_CUEQ)
+	rm -rf $@
+	python scripts/convert_mace_model_to_jax.py --torch-model $< --output-dir $@ --dtype float64
+
 $(TORCH_F32):
 	python scripts/create_mace_foundation_model.py --output $@ --default-dtype float32 --output-dtype float32 --family $(FOUNDATION_FAMILY) --model $(FOUNDATION_MODEL) --enable-cueq --only-cueq
 
 $(TORCH_F64):
 	python scripts/create_mace_foundation_model.py --output $@ --default-dtype float64 --output-dtype float64 --family $(FOUNDATION_FAMILY) --model $(FOUNDATION_MODEL) --enable-cueq --only-cueq
+
+$(TORCH_F32_NO_CUEQ):
+	python scripts/create_mace_foundation_model.py --output $@ --default-dtype float32 --output-dtype float32 --family $(FOUNDATION_FAMILY) --model $(FOUNDATION_MODEL)
+
+$(TORCH_F64_NO_CUEQ):
+	python scripts/create_mace_foundation_model.py --output $@ --default-dtype float64 --output-dtype float64 --family $(FOUNDATION_FAMILY) --model $(FOUNDATION_MODEL)
