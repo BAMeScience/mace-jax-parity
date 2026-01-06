@@ -74,6 +74,12 @@ def _parse_args() -> argparse.Namespace:
         help="Batch size fed into the equitrain predict routines (default: 4).",
     )
     parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=0,
+        help="Number of data loading workers for both Torch and JAX (default: 0).",
+    )
+    parser.add_argument(
         "--max-nodes-per-batch",
         type=int,
         default=200000,
@@ -132,8 +138,7 @@ def _make_predict_args(base_args, backend: str, model_path: Path, predict_file: 
     predict_args.model_wrapper = getattr(base_args, "model_wrapper", None) or "mace"
     if not hasattr(predict_args, "pin_memory"):
         predict_args.pin_memory = False
-    if not hasattr(predict_args, "num_workers"):
-        predict_args.num_workers = 0
+    predict_args.num_workers = int(getattr(base_args, "num_workers", 0))
     if not hasattr(predict_args, "batch_max_nodes"):
         predict_args.batch_max_nodes = None
     if not hasattr(predict_args, "batch_max_edges"):
@@ -165,6 +170,7 @@ def _predict_jax(args, predict_file: Path):
     )
     predict_args.jax_platform = _device_to_jax_platform(args.device)
     predict_args.tqdm = True
+    predict_args.tqdm_desc = f"Predict jax ({predict_file.name})"
     energy, _, _ = jax_predict(predict_args)
     return np.asarray(energy)
 
@@ -209,8 +215,16 @@ def _predict_torch_gpu(predict_args, predict_file: Path, device: torch.device):
         return np.zeros((0,), dtype=np.float32)
 
     energies = []
+    iterator = loader
+    if getattr(predict_args, "tqdm", False):
+        iterator = tqdm(
+            loader,
+            desc=f"Predict torch ({predict_file.name})",
+            unit="batch",
+        )
+
     with torch.no_grad():
-        for data_list in loader:
+        for data_list in iterator:
             for data in data_list:
                 if hasattr(data, "to"):
                     data = data.to(device)

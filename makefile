@@ -21,19 +21,19 @@ compare64: compare64-cpu compare64-gpu
 
 compare32-cpu: $(JAX_F32)
 	mkdir -p results
-	python scripts/compare_mace_torch_jax.py --torch-model $(TORCH_F32) --jax-model $(JAX_F32) --data-dir data/mptraj --dtype float32 --split valid --device cpu --diff-csv results/compare_cpu_f32.csv
+	python scripts/compare_mace_torch_jax.py --torch-model $(TORCH_F32) --jax-model $(JAX_F32) --data-dir data/mptraj --dtype float32 --split valid --device cpu --num-workers 5 --diff-csv results/compare_cpu_f32.csv
 
 compare32-gpu: $(JAX_F32)
 	mkdir -p results
-	python scripts/compare_mace_torch_jax.py --torch-model $(TORCH_F32) --jax-model $(JAX_F32) --data-dir data/mptraj --dtype float32 --split valid --device cuda --diff-csv results/compare_gpu_f32.csv
+	python scripts/compare_mace_torch_jax.py --torch-model $(TORCH_F32) --jax-model $(JAX_F32) --data-dir data/mptraj --dtype float32 --split valid --device cuda --num-workers 5 --diff-csv results/compare_gpu_f32.csv
 
 compare64-cpu: $(JAX_F64)
 	mkdir -p results
-	python scripts/compare_mace_torch_jax.py --torch-model $(TORCH_F64) --jax-model $(JAX_F64) --data-dir data/mptraj --dtype float64 --split valid --device cpu --max-edges-per-batch 240000 --max-nodes-per-batch 200000 --diff-csv results/compare_cpu_f64.csv
+	python scripts/compare_mace_torch_jax.py --torch-model $(TORCH_F64) --jax-model $(JAX_F64) --data-dir data/mptraj --dtype float64 --split valid --device cpu --max-edges-per-batch 240000 --max-nodes-per-batch 100000 --num-workers 5 --diff-csv results/compare_cpu_f64.csv
 
 compare64-gpu: $(JAX_F64)
 	mkdir -p results
-	python scripts/compare_mace_torch_jax.py --torch-model $(TORCH_F64) --jax-model $(JAX_F64) --data-dir data/mptraj --dtype float64 --split valid --device cuda --max-edges-per-batch 240000 --max-nodes-per-batch 200000 --diff-csv results/compare_gpu_f64.csv
+	python scripts/compare_mace_torch_jax.py --torch-model $(TORCH_F64) --jax-model $(JAX_F64) --data-dir data/mptraj --dtype float64 --split valid --device cuda --max-edges-per-batch 240000 --max-nodes-per-batch 100000 --num-workers 5 --diff-csv results/compare_gpu_f64.csv
 
 ################################################################################
 
