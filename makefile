@@ -19,7 +19,7 @@ all:
 	@echo "  compare        - Compare MACE JAX model with MACE Torch model"
 	@echo "  compare-nocueq - Compare without cuEq flags"
 	@echo "  benchmark      - Benchmark MACE JAX model against MACE Torch model"
-	@echo "  plot           - Plot CPU/GPU energy difference histograms"
+	@echo "  plot           - Plot CPU/GPU energy difference histograms (grid)"
 
 ################################################################################
 
@@ -27,8 +27,8 @@ compare: compare32 compare64 compare32-nocueq compare64-nocueq
 compare-nocueq: compare32-nocueq compare64-nocueq
 compare32: compare32-cpu compare32-gpu
 compare64: compare64-cpu compare64-gpu
-compare32-nocueq: compare32-nocueq-cpu compare32-nocueq-gpu
-compare64-nocueq: compare64-nocueq-cpu compare64-nocueq-gpu
+compare32-nocueq: compare32-nocueq-gpu
+compare64-nocueq: compare64-nocueq-gpu
 
 compare32-cpu: $(JAX_F32)
 	mkdir -p results
@@ -46,17 +46,9 @@ compare64-gpu: $(JAX_F64)
 	mkdir -p results
 	python scripts/compare_mace_torch_jax.py --torch-model $(TORCH_F64) --jax-model $(JAX_F64) --data-dir data/mptraj --dtype float64 --split valid --device cuda --max-edges-per-batch 10000 --num-workers $(NUM_WORKERS) --diff-csv results/compare_gpu_f64.csv
 
-compare32-nocueq-cpu: $(JAX_F32_NO_CUEQ)
-	mkdir -p results
-	python scripts/compare_mace_torch_jax.py --torch-model $(TORCH_F32_NO_CUEQ) --jax-model $(JAX_F32_NO_CUEQ) --data-dir data/mptraj --dtype float32 --split valid --device cpu --max-edges-per-batch 10000 --num-workers $(NUM_WORKERS) --diff-csv results/compare_cpu_f32_nocueq.csv
-
 compare32-nocueq-gpu: $(JAX_F32_NO_CUEQ)
 	mkdir -p results
 	python scripts/compare_mace_torch_jax.py --torch-model $(TORCH_F32_NO_CUEQ) --jax-model $(JAX_F32_NO_CUEQ) --data-dir data/mptraj --dtype float32 --split valid --device cuda --max-edges-per-batch 10000 --num-workers $(NUM_WORKERS) --diff-csv results/compare_gpu_f32_nocueq.csv
-
-compare64-nocueq-cpu: $(JAX_F64_NO_CUEQ)
-	mkdir -p results
-	python scripts/compare_mace_torch_jax.py --torch-model $(TORCH_F64_NO_CUEQ) --jax-model $(JAX_F64_NO_CUEQ) --data-dir data/mptraj --dtype float64 --split valid --device cpu --max-edges-per-batch 10000 --num-workers $(NUM_WORKERS) --diff-csv results/compare_cpu_f64_nocueq.csv
 
 compare64-nocueq-gpu: $(JAX_F64_NO_CUEQ)
 	mkdir -p results
@@ -82,27 +74,34 @@ benchmark-torch-train: $(TORCH_F32)
 	mkdir -p results
 	accelerate launch scripts/benchmark_mace_torch_train.py --torch-model $(TORCH_F32) --data-dir data/mptraj --split valid --dtype float32 --batch-size 80 --learning-rate 1e-3 --num-workers 24 --tqdm --csv-output results/benchmark_torch_train.csv
 
-plot-comparison: plot-comparison-cpu plot-comparison-gpu plot-comparison-cpu-nocueq plot-comparison-gpu-nocueq
+plot-comparison: plot-comparison-grid
+
+plot-comparison-grid:
+	mkdir -p results
+	python scripts/plot_energy_diff.py \
+		--cpu-f32 results/compare_cpu_f32.csv \
+		--cpu-f64 results/compare_cpu_f64.csv \
+		--gpu-f32 results/compare_gpu_f32.csv \
+		--gpu-f64 results/compare_gpu_f64.csv \
+		--gpu-nocueq-f32 results/compare_gpu_f32_nocueq.csv \
+		--gpu-nocueq-f64 results/compare_gpu_f64_nocueq.csv \
+		--out results/energy_diff_grid.png \
+		--model-name $(FOUNDATION_NAME)
 
 plot-comparison-cpu:
 	mkdir -p results
-	python scripts/plot_energy_diff.py --cpu-csv results/compare_cpu_f32.csv --gpu-csv results/compare_cpu_f32.csv --out results/energy_diff_cpu_f32.png --dtype float32 --model-name $(FOUNDATION_NAME)
-	python scripts/plot_energy_diff.py --cpu-csv results/compare_cpu_f64.csv --gpu-csv results/compare_cpu_f64.csv --out results/energy_diff_cpu_f64.png --dtype float64 --model-name $(FOUNDATION_NAME)
+	python scripts/plot_energy_diff.py --cpu-csv results/compare_cpu_f32.csv --out results/energy_diff_cpu_f32.png --dtype float32 --model-name $(FOUNDATION_NAME)
+	python scripts/plot_energy_diff.py --cpu-csv results/compare_cpu_f64.csv --out results/energy_diff_cpu_f64.png --dtype float64 --model-name $(FOUNDATION_NAME)
 
 plot-comparison-gpu:
 	mkdir -p results
-	python scripts/plot_energy_diff.py --cpu-csv results/compare_gpu_f32.csv --gpu-csv results/compare_gpu_f32.csv --out results/energy_diff_gpu_f32.png --dtype float32 --model-name $(FOUNDATION_NAME)
-	python scripts/plot_energy_diff.py --cpu-csv results/compare_gpu_f64.csv --gpu-csv results/compare_gpu_f64.csv --out results/energy_diff_gpu_f64.png --dtype float64 --model-name $(FOUNDATION_NAME)
-
-plot-comparison-cpu-nocueq:
-	mkdir -p results
-	python scripts/plot_energy_diff.py --cpu-csv results/compare_cpu_f32_nocueq.csv --gpu-csv results/compare_cpu_f32_nocueq.csv --out results/energy_diff_cpu_f32_nocueq.png --dtype float32 --model-name $(FOUNDATION_NAME)
-	python scripts/plot_energy_diff.py --cpu-csv results/compare_cpu_f64_nocueq.csv --gpu-csv results/compare_cpu_f64_nocueq.csv --out results/energy_diff_cpu_f64_nocueq.png --dtype float64 --model-name $(FOUNDATION_NAME)
+	python scripts/plot_energy_diff.py --gpu-csv results/compare_gpu_f32.csv --out results/energy_diff_gpu_f32.png --dtype float32 --model-name $(FOUNDATION_NAME)
+	python scripts/plot_energy_diff.py --gpu-csv results/compare_gpu_f64.csv --out results/energy_diff_gpu_f64.png --dtype float64 --model-name $(FOUNDATION_NAME)
 
 plot-comparison-gpu-nocueq:
 	mkdir -p results
-	python scripts/plot_energy_diff.py --cpu-csv results/compare_gpu_f32_nocueq.csv --gpu-csv results/compare_gpu_f32_nocueq.csv --out results/energy_diff_gpu_f32_nocueq.png --dtype float32 --model-name $(FOUNDATION_NAME)
-	python scripts/plot_energy_diff.py --cpu-csv results/compare_gpu_f64_nocueq.csv --gpu-csv results/compare_gpu_f64_nocueq.csv --out results/energy_diff_gpu_f64_nocueq.png --dtype float64 --model-name $(FOUNDATION_NAME)
+	python scripts/plot_energy_diff.py --gpu-csv results/compare_gpu_f32_nocueq.csv --out results/energy_diff_gpu_f32_nocueq.png --dtype float32 --model-name $(FOUNDATION_NAME)
+	python scripts/plot_energy_diff.py --gpu-csv results/compare_gpu_f64_nocueq.csv --out results/energy_diff_gpu_f64_nocueq.png --dtype float64 --model-name $(FOUNDATION_NAME)
 
 ################################################################################
 
