@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import logging
 from pathlib import Path
 
 import numpy as np
@@ -82,14 +83,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-nodes-per-batch",
         type=int,
-        default=200000,
-        help="JAX/Torch greedy packer node cap per macro-batch.",
+        default=None,
+        help="Optional JAX/Torch greedy packer node cap per macro-batch.",
     )
     parser.add_argument(
         "--max-edges-per-batch",
         type=int,
-        default=480000,
-        help="JAX/Torch greedy packer edge cap per macro-batch.",
+        default=None,
+        help="Optional JAX/Torch greedy packer edge cap per macro-batch.",
     )
     parser.add_argument(
         "--energy-tol",
@@ -242,6 +243,8 @@ def _predict_torch_gpu(predict_args, predict_file: Path, device: torch.device):
 
 def main() -> None:
     args = _parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(message)s")
 
     if getattr(torch, args.dtype, None) is None:
         raise ValueError(f"Unsupported Torch dtype: {args.dtype}")
