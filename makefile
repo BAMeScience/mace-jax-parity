@@ -82,10 +82,27 @@ benchmark-torch-train: $(TORCH_F32)
 	mkdir -p results
 	accelerate launch scripts/benchmark_mace_torch_train.py --torch-model $(TORCH_F32) --data-dir data/mptraj --split valid --dtype float32 --batch-size 80 --learning-rate 1e-3 --num-workers 24 --tqdm --csv-output results/benchmark_torch_train.csv
 
-plot-comparison:
+plot-comparison: plot-comparison-cpu plot-comparison-gpu plot-comparison-cpu-nocueq plot-comparison-gpu-nocueq
+
+plot-comparison-cpu:
 	mkdir -p results
-	python scripts/plot_energy_diff.py --cpu-csv results/compare_cpu_f32.csv --gpu-csv results/compare_gpu_f32.csv --out results/energy_diff_f32.png --dtype float32 --model-name $(FOUNDATION_NAME)
-	python scripts/plot_energy_diff.py --cpu-csv results/compare_cpu_f64.csv --gpu-csv results/compare_gpu_f64.csv --out results/energy_diff_f64.png --dtype float64 --model-name $(FOUNDATION_NAME)
+	python scripts/plot_energy_diff.py --cpu-csv results/compare_cpu_f32.csv --gpu-csv results/compare_cpu_f32.csv --out results/energy_diff_cpu_f32.png --dtype float32 --model-name $(FOUNDATION_NAME)
+	python scripts/plot_energy_diff.py --cpu-csv results/compare_cpu_f64.csv --gpu-csv results/compare_cpu_f64.csv --out results/energy_diff_cpu_f64.png --dtype float64 --model-name $(FOUNDATION_NAME)
+
+plot-comparison-gpu:
+	mkdir -p results
+	python scripts/plot_energy_diff.py --cpu-csv results/compare_gpu_f32.csv --gpu-csv results/compare_gpu_f32.csv --out results/energy_diff_gpu_f32.png --dtype float32 --model-name $(FOUNDATION_NAME)
+	python scripts/plot_energy_diff.py --cpu-csv results/compare_gpu_f64.csv --gpu-csv results/compare_gpu_f64.csv --out results/energy_diff_gpu_f64.png --dtype float64 --model-name $(FOUNDATION_NAME)
+
+plot-comparison-cpu-nocueq:
+	mkdir -p results
+	python scripts/plot_energy_diff.py --cpu-csv results/compare_cpu_f32_nocueq.csv --gpu-csv results/compare_cpu_f32_nocueq.csv --out results/energy_diff_cpu_f32_nocueq.png --dtype float32 --model-name $(FOUNDATION_NAME)
+	python scripts/plot_energy_diff.py --cpu-csv results/compare_cpu_f64_nocueq.csv --gpu-csv results/compare_cpu_f64_nocueq.csv --out results/energy_diff_cpu_f64_nocueq.png --dtype float64 --model-name $(FOUNDATION_NAME)
+
+plot-comparison-gpu-nocueq:
+	mkdir -p results
+	python scripts/plot_energy_diff.py --cpu-csv results/compare_gpu_f32_nocueq.csv --gpu-csv results/compare_gpu_f32_nocueq.csv --out results/energy_diff_gpu_f32_nocueq.png --dtype float32 --model-name $(FOUNDATION_NAME)
+	python scripts/plot_energy_diff.py --cpu-csv results/compare_gpu_f64_nocueq.csv --gpu-csv results/compare_gpu_f64_nocueq.csv --out results/energy_diff_gpu_f64_nocueq.png --dtype float64 --model-name $(FOUNDATION_NAME)
 
 ################################################################################
 
