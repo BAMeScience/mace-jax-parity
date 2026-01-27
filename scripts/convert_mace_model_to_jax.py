@@ -39,9 +39,9 @@ except ImportError:  # pragma: no cover
     TorchIrreps = None
 
 from flax import serialization
-from mace_jax.cli import mace_jax_from_torch
-
 from mace.tools.scripts_utils import extract_config_mace_model
+from mace_jax.cli import mace_jax_from_torch
+from mace_jax.nnx_utils import state_to_serializable_dict
 
 
 def _sanitize(obj):
@@ -154,7 +154,9 @@ def _as_cue_config_dict(cue_cfg) -> dict | None:
         return None
 
     layout = config.get("layout_str") or config.get("layout") or "mul_ir"
-    layout_name = layout if isinstance(layout, str) else getattr(layout, "name", "mul_ir")
+    layout_name = (
+        layout if isinstance(layout, str) else getattr(layout, "name", "mul_ir")
+    )
     group_val = config.get("group", "O3")
     if hasattr(group_val, "__name__"):
         group_name = group_val.__name__.split(".")[-1]
@@ -197,12 +199,13 @@ def main() -> None:
         if "irreps" in key.lower():
             config[key] = _format_irreps(value)
 
-    jax_model, jax_params, _template = mace_jax_from_torch.convert_model(torch_model, config)
+    graphdef, state, _template = mace_jax_from_torch.convert_model(torch_model, config)
 
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    (output_dir / "params.msgpack").write_bytes(serialization.to_bytes(jax_params))
+    params_payload = state_to_serializable_dict(state)
+    (output_dir / "params.msgpack").write_bytes(serialization.to_bytes(params_payload))
 
     (output_dir / "config.json").write_text(json.dumps(_sanitize(config), indent=2))
 
