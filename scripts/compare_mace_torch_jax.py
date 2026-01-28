@@ -11,7 +11,20 @@ from __future__ import annotations
 import argparse
 import csv
 import logging
+import warnings
 from pathlib import Path
+
+warnings.filterwarnings(
+    "ignore",
+    message="Environment variable TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD detected.*",
+    category=UserWarning,
+)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings(
+    "ignore",
+    message="`torch_geometric.distributed` has been deprecated since 2\\.7\\.0.*",
+    category=DeprecationWarning,
+)
 
 import numpy as np
 import torch
@@ -32,12 +45,13 @@ if callable(add_safe_globals):  # pragma: no cover - guard for torch<2.6
         safe_globals.append(ScaleShiftMACE)
     add_safe_globals(safe_globals)
 
-from equitrain import get_args_parser_predict
 from equitrain.backends.jax_predict import predict as jax_predict
 from equitrain.backends.torch_model import get_model as get_torch_model
 from equitrain.backends.torch_predict import _predict as torch_predict_impl
 from equitrain.backends.torch_utils import set_dtype as torch_set_dtype
 from equitrain.data.backend_torch.loaders import get_dataloader as get_torch_loader
+
+from equitrain import get_args_parser_predict
 
 
 def _parse_args() -> argparse.Namespace:

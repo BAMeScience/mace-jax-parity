@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import warnings
 from pathlib import Path
 
 import torch
@@ -42,6 +43,17 @@ from flax import serialization
 from mace.tools.scripts_utils import extract_config_mace_model
 from mace_jax.cli import mace_jax_from_torch
 from mace_jax.nnx_utils import state_to_serializable_dict
+
+warnings.filterwarnings(
+    "ignore",
+    message="Environment variable TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD detected.*",
+    category=UserWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message="`torch_geometric.distributed` has been deprecated since 2\\.7\\.0.*",
+    category=DeprecationWarning,
+)
 
 
 def _sanitize(obj):
