@@ -280,9 +280,9 @@ def main() -> None:
 
     try:
         for h5_path in h5_files:
+            energy_jax = _predict_jax(args, h5_path)
             with torch.no_grad():
                 energy_torch = _predict_torch(args, h5_path)
-            energy_jax = _predict_jax(args, h5_path)
 
             if energy_torch.shape != energy_jax.shape:
                 raise RuntimeError(
